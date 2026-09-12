@@ -60,7 +60,7 @@ use Laracasts\Presenter\PresentableTrait;
  * @property string|null $portal_domain
  * @property bool $enable_modules //alias for DocuNinja is active / available
  * @property object $custom_fields
- * @property \App\DataMapper\CompanySettings|\stdClass $settings
+ * @property \App\DataMapper\CompanySettings|\stdClass|array $settings
  * @property string $slack_webhook_url
  * @property string $google_analytics_key
  * @property int|null $created_at
@@ -123,6 +123,9 @@ use Laracasts\Presenter\PresentableTrait;
  * @property string|null $inbound_mailbox_blacklist
  * @property string|null $e_invoice_certificate_passphrase
  * @property string|null $e_invoice_certificate
+ * @property object|null $e_invoice
+ * @property string|null $shopify_name
+ * @property string|null $shopify_access_token
  * @property object|null $origin_tax_data
  * @property int $deleted_at
  * @property string|null $smtp_username
@@ -405,21 +408,6 @@ class Company extends BaseModel
 
     protected $with = [];
 
-    // public static $modules = [
-    //     self::ENTITY_RECURRING_INVOICE => 1,
-    //     self::ENTITY_CREDIT => 2,
-    //     self::ENTITY_QUOTE => 4,
-    //     self::ENTITY_TASK => 8,
-    //     self::ENTITY_EXPENSE => 16,
-    //     self::ENTITY_PROJECT => 32,
-    //     self::ENTITY_VENDOR => 64,
-    //     self::ENTITY_TICKET => 128,
-    //     self::ENTITY_PROPOSAL => 256,
-    //     self::ENTITY_RECURRING_EXPENSE => 512,
-    //     self::ENTITY_RECURRING_TASK => 1024,
-    //     self::ENTITY_RECURRING_QUOTE => 2048,
-    // ];
-
     public function shouldCalculateTax()
     {
         return $this->calculate_taxes && in_array($this->getSetting('country_id'), $this->tax_coverage_countries);
@@ -575,7 +563,7 @@ class Company extends BaseModel
 
     public function activities(): HasMany
     {
-        return $this->hasMany(Activity::class)->orderBy('id', 'DESC')->take(50);
+        return $this->hasMany(Activity::class)->where('created_at', '>=', now()->subDays(90)->toDateTimeString())->orderBy('id', 'DESC')->take(50);
     }
 
     /**
@@ -760,7 +748,8 @@ class Company extends BaseModel
 
     public function getSetting($setting)
     {
-        //todo $this->setting ?? false
+        $setting = $setting ?? '';
+        
         if (property_exists($this->settings, $setting) != false) {
             return $this->settings->{$setting};
         }
@@ -834,7 +823,7 @@ class Company extends BaseModel
 
     public function tokens_hashed(): \Illuminate\Database\Eloquent\Relations\HasMany
     {
-        return $this->hasMany(CompanyToken::class);
+        return $this->hasMany(CompanyToken::class)->where('is_system', false);
     }
 
     public function company_users(): \Illuminate\Database\Eloquent\Relations\HasMany
@@ -1046,6 +1035,11 @@ class Company extends BaseModel
      */
     public function peppolSendingEnabled(): bool
     {
+        /** FRREPORTING:: French senders are not permitted on the network - fail silently. */
+        if ($this->country()?->iso_3166_2 === 'FR') {
+            return false;
+        }
+
         return !$this->account->is_flagged && $this->account->e_invoice_quota > 0 && isset($this->legal_entity_id) && isset($this->tax_data->acts_as_sender) && $this->tax_data->acts_as_sender;
     }
 
@@ -1078,10 +1072,8 @@ class Company extends BaseModel
      */
     public function shouldPushToQuickbooks(string $entity): bool
     {
-        // FASTEST CHECK: Raw database column (no object instantiation, no JSON decode)
-        // This is the cheapest possible check - just a null comparison
-        // For companies without QuickBooks, this returns immediately with ~0.001ms overhead
-        if (is_null($this->getRawOriginal('quickbooks')) || !$this->account->isPaid()) {
+        
+        if (is_null($this->getRawOriginal('quickbooks')) || $this->account->isFreeHostedClient()) {
             return false;
         }
 
@@ -1109,6 +1101,5 @@ class Company extends BaseModel
     public function docuninjaActive(): bool
     {
         return (app()->environment('local') || Ninja::isHosted()) && $this->enable_modules && $this->account->hasFeature(\App\Models\Account::FEATURE_INVOICE_SETTINGS);
-        // return $this->enable_modules && Ninja::isHosted();
     }
 }

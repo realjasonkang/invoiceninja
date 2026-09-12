@@ -190,6 +190,7 @@ class EInvoicePeppolController extends BaseController
 
         $settings = $company->settings;
         $settings->e_invoice_type = 'EN16931';
+        $settings->france_reporting_enabled = false;
 
         $company->settings = $settings;
 
@@ -232,7 +233,7 @@ class EInvoicePeppolController extends BaseController
         $response = $storecove
             ->proxy
             ->setCompany($company)
-            ->addAdditionalTaxIdentifier($request->validated());
+            ->addAdditionalTaxIdentifier($request->all());
 
         if (data_get($response, 'status') === 'error') {
             return response()->json(data_get($response, 'message'), status: $response['code']);

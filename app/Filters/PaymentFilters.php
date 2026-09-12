@@ -13,7 +13,6 @@
 namespace App\Filters;
 
 use App\Models\Payment;
-use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Database\Eloquent\Builder;
 
@@ -266,31 +265,80 @@ class PaymentFilters extends QueryFilters
     }
 
     /**
-     * date_range
+     * include
      *
-     * only filters on date
-     * @param  string $date_range
+     * Ensure we pad out additional includes to prevent N+1 queries
+     *
+     * @param  string $includes
      * @return Builder
      */
-    public function date_range(string $date_range = ''): Builder
+    public function include(string $includes = ''): Builder
     {
-        $parts = explode(",", $date_range);
-
-        if (!isset($parts[2])) {
+        if (trim($includes) === '') {
             return $this->builder;
         }
+        
+        $requested_includes = array_values(array_filter(
+            array_map('trim', explode(',', $includes)),
+            static fn (string $include): bool => $include !== ''
+        ));
 
-        try {
+        $include_roots = array_map(
+            static fn (string $include): string => explode('.', trim($include), 2)[0],
+            $requested_includes
+        );
 
-            $start_date = Carbon::parse($parts[1]);
-            $end_date = Carbon::parse($parts[2]);
-
-
-            return $this->builder->whereBetween('date', [$start_date, $end_date]);
-        } catch (\Exception $e) {
-            return $this->builder;
+        if (in_array('invoices', $include_roots, true)) {
+            $this->builder->with([
+                'invoices.invitations.company',
+                'invoices.invitations.contact',
+                'invoices.documents',
+            ]);
         }
 
+        if (in_array('credits', $include_roots, true)) {
+            $this->builder->with([
+                'credits.invitations.company',
+                'credits.invitations.contact',
+                'credits.documents',
+            ]);
+        }
+
+        if (in_array('client', $include_roots, true)) {
+            $this->builder->with([
+                'client.locations',
+            ]);
+        }
+
+        if ($this->includesPath($requested_includes, 'invoices.client')) {
+            $this->builder->with([
+                'invoices.client.locations',
+            ]);
+        }
+
+        if ($this->includesPath($requested_includes, 'invoices.credits')) {
+            $this->builder->with([
+                'invoices.credits.invitations.company',
+                'invoices.credits.invitations.contact',
+                'invoices.credits.documents',
+            ]);
+        }
+
+        return $this->builder;
+    }
+
+    /**
+     * @param array<int, string> $requested_includes
+     */
+    private function includesPath(array $requested_includes, string $path): bool
+    {
+        foreach ($requested_includes as $include) {
+            if ($include === $path || str_starts_with($include, "{$path}.")) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**

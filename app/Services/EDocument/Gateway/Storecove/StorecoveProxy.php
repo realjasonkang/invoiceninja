@@ -14,6 +14,7 @@ namespace App\Services\EDocument\Gateway\Storecove;
 
 use App\Utils\Ninja;
 use App\Models\Company;
+use App\Services\EDocument\Standards\France\FranceEReportStorecoveProjection;
 use Illuminate\Support\Facades\Http;
 
 class StorecoveProxy
@@ -57,6 +58,7 @@ class StorecoveProxy
     {
         $data = [
             ...$data,
+            'tenant_id' => $this->company->company_key,
             'classification' => $data['classification'] ?? $this->company->settings->classification,
             'vat_number' => $data['vat_number'] ?? $this->company->settings->vat_number,
             'id_number' => $data['id_number'] ?? $this->company->settings->id_number,
@@ -131,6 +133,7 @@ class StorecoveProxy
     public function addAdditionalTaxIdentifier(array $data): array
     {
         $scheme = $this->storecove->router->resolveTaxScheme($data['country'], $this->company->settings->classification);
+        $data['identifier'] ??= $data['vat_number'] ?? null;
 
         $data = [
             ...$data,
@@ -141,7 +144,7 @@ class StorecoveProxy
 
         if (Ninja::isHosted()) {
 
-            $response = $this->storecove->addAdditionalTaxIdentifier($data['legal_entity_id'], $data['vat_number'], $scheme);
+            $response = $this->storecove->legalEntity->addAdditionalTaxIdentifier($data['legal_entity_id'], $data);
 
             if (is_array($response)) {
                 return $response;
@@ -269,6 +272,46 @@ class StorecoveProxy
     }
 
     /**
+     * Submit a Storecove document payload through the hosted or self-hosted path.
+     *
+     * @param  array<string, mixed> $payload
+     * @return array<string, mixed>
+     */
+    public function submitDocument(array $payload): array
+    {
+        if (data_get($payload, 'document.documentType') === 'fr_e_report'
+            && (int) ($payload['legalEntityId'] ?? 0) !== (int) $this->company->legal_entity_id) {
+            throw new \InvalidArgumentException('France e-report legalEntityId does not match the selected company.');
+        }
+
+        $payload = [
+            ...$payload,
+            'tenant_id' => $payload['tenant_id'] ?? $this->company->company_key,
+            'account_key' => $payload['account_key'] ?? $this->company->account->key,
+            'e_invoicing_token' => $payload['e_invoicing_token'] ?? $this->company->account->e_invoicing_token,
+        ];
+
+        if (! array_key_exists('forDocumentSubmissionGuid', $payload)) {
+            $payload['legal_entity_id'] ??= $payload['legalEntityId'] ?? $this->company->legal_entity_id;
+        }
+
+        if (Ninja::isHosted()) {
+            $storecovePayload = data_get($payload, 'document.documentType') === 'fr_e_report'
+                ? FranceEReportStorecoveProjection::from($payload)
+                : $payload;
+            $response = $this->storecove->sendJsonDocument($storecovePayload);
+
+            if (is_string($response)) {
+                return ['guid' => str_replace('"', '', $response)];
+            }
+
+            return $this->handleResponseError($response);
+        }
+
+        return $this->remoteRequest('/api/einvoice/submission', $payload);
+    }
+
+    /**
      * handleResponseError
      *
      * Generic error handler that can return an array response
@@ -386,6 +429,9 @@ class StorecoveProxy
             'Content-Type' => 'application/json',
             'Accept' => 'application/json',
             'X-EInvoice-Token' => $this->company->account->e_invoicing_token,
+            // Required by the SelfHostEInvoice gate on /api/einvoice/submission; without it
+            // proxied submissions (e.g. France e-reports) fail authentication.
+            'X-API-SELF-HOST-TOKEN' => config('ninja.license_key'),
             "X-Requested-With" => "XMLHttpRequest",
         ];
 

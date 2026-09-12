@@ -69,6 +69,7 @@ class Statement
                 $variables['values']['$end_date'] = $this->translateDate($this->options['end_date'], $this->client->date_format(), $this->client->locale());
                 $variables['labels']['$start_date_label'] = ctrans('texts.start_date');
                 $variables['labels']['$end_date_label'] = ctrans('texts.end_date');
+                $variables['values']['$entity_footer'] = $this->client->getSetting('invoice_footer');
 
                 $pdf = null;
 
@@ -84,6 +85,7 @@ class Statement
 
 
             $variables['values']['$show_paid_stamp'] = 'none';
+            $variables['values']['$entity_footer'] = $this->client->getSetting('invoice_footer');
 
             $options = [
                 // 'client' => $this->entity->client,
@@ -312,7 +314,7 @@ class Statement
     public function getInvoices(): Builder
     {
         return Invoice::withTrashed()
-            ->with('payments.type')
+            ->with('payments.type', 'payments.tags', 'tags')
             ->where('is_deleted', false)
             ->where('company_id', $this->client->company_id)
             ->where('client_id', $this->client->id)
@@ -354,7 +356,7 @@ class Statement
     protected function getPayments(): Builder
     {
         return Payment::withTrashed()
-            ->with('client.country', 'invoices')
+            ->with('client.country', 'invoices', 'tags')
             ->where('company_id', $this->client->company_id)
             ->where('client_id', $this->client->id)
             ->whereIn('status_id', [Payment::STATUS_COMPLETED, Payment::STATUS_PARTIALLY_REFUNDED, Payment::STATUS_REFUNDED])
@@ -367,6 +369,7 @@ class Statement
     {
         return Payment::query()
                         ->withTrashed()
+                        ->with('tags')
                         ->where('company_id', $this->client->company_id)
                         ->where('client_id', $this->client->id)
                         ->whereIn('status_id', [Payment::STATUS_COMPLETED, Payment::STATUS_PENDING, Payment::STATUS_PARTIALLY_REFUNDED, Payment::STATUS_REFUNDED])
@@ -382,7 +385,7 @@ class Statement
     protected function getCredits(): Builder
     {
         return Credit::withTrashed()
-            ->with('client.country', 'invoice')
+            ->with('client.country', 'invoice', 'tags')
             ->where('is_deleted', false)
             ->where('company_id', $this->client->company_id)
             ->where('client_id', $this->client->id)

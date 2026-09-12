@@ -46,6 +46,17 @@ class ProcessBankRules extends AbstractService
 
     public function run()
     {
+
+        if($this->bank_transaction->status_id != BankTransaction::STATUS_UNMATCHED ||
+        !empty($this->bank_transaction->expense_id) ||
+        !empty($this->bank_transaction->payment_id) ||
+        !empty($this->bank_transaction->invoice_ids) ||
+        $this->bank_transaction->bank_integration->is_deleted ||
+        $this->bank_transaction->bank_integration->trashed()
+        ) {
+            return;
+        }
+
         if ($this->bank_transaction->base_type == 'DEBIT') {
             $this->matchDebit();
         } else {
@@ -278,6 +289,18 @@ class ProcessBankRules extends AbstractService
             $rule_count = count($bank_transaction_rule['rules']);
 
             foreach ($bank_transaction_rule['rules'] as $rule) {
+
+                if ($rule['search_key'] == 'participant') {
+                    if ($this->matchStringOperator($this->bank_transaction->participant ?? '', $rule['value'] ?? '', $rule['operator'] ?? '')) {
+                        $matches++;
+                    }
+                }
+
+                if ($rule['search_key'] == 'participant_name') {
+                    if ($this->matchStringOperator($this->bank_transaction->participant_name ?? '', $rule['value'] ?? '', $rule['operator'] ?? '')) {
+                        $matches++;
+                    }
+                }
 
                 if ($rule['search_key'] == 'description') {
                     if ($this->matchStringOperator($this->bank_transaction->description ?? '', $rule['value'] ?? '', $rule['operator'] ?? '')) {

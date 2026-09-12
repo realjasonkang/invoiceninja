@@ -39,7 +39,7 @@ class ARSummaryReportOptimizationTest extends TestCase
         
         $this->user = User::factory()->create([
             'account_id' => $account->id,
-            'email' => "{md5(uniqid())}@example.com",
+            'email' => "{md5(uniqid())}@gmail.com",
         ]);
     }
 
@@ -515,6 +515,12 @@ class ARSummaryReportOptimizationTest extends TestCase
      */
     public function testPerformanceExecutionTime()
     {
+
+
+        if (config('ninja.testvars.travis') !== false) {
+            $this->markTestSkipped('Skip test for GH Actions');
+        }
+
         $this->createTestData(50);
         $clientIds = collect($this->testClients)->pluck('id')->toArray();
 

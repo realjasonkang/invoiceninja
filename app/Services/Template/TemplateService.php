@@ -26,6 +26,7 @@ use App\Models\Task;
 use App\Models\User;
 use App\Models\Vendor;
 use App\Services\Template\TemplateMock;
+use App\Services\Payment\PaymentApplicationDateResolver;
 use App\Utils\HostedPDF\NinjaPdf;
 use App\Utils\HtmlEngine;
 use App\Utils\Number;
@@ -189,6 +190,7 @@ class TemplateService
              ->setGlobals()
              ->parseNinjaBlocks()
              ->processVariables($data)
+             ->processScalars()
              ->parseGlobalStacks()
              ->parseVariables();
 
@@ -509,6 +511,10 @@ class TemplateService
         $html .= $partials['design']['body'];
         $html .= $partials['design']['footer'];
 
+        if ($html === '') {
+            $html = '<p></p>';
+        }
+        
         @$this->document->loadHTML($this->convertHtmlToEntities($html));
         // @$this->document->loadHTML(mb_convert_encoding($html, 'HTML-ENTITIES', 'UTF-8'));
 
@@ -535,13 +541,13 @@ class TemplateService
 
             match ($key) {
                 'variables' => $processed = $value->first() ?? [], //@phpstan-ignore-line
-                'invoices' => $processed = (new HtmlEngine($value->first()->invitations()->first()))->setSettings($this->getSettings())->generateLabelsAndValues() ?? [],
-                'quotes' => $processed = (new HtmlEngine($value->first()->invitations()->first()))->setSettings($this->getSettings())->generateLabelsAndValues() ?? [],
-                'credits' => $processed = (new HtmlEngine($value->first()->invitations()->first()))->setSettings($this->getSettings())->generateLabelsAndValues() ?? [],
+                'invoices' => $processed = (new HtmlEngine($value->first()->invitations()->first()))->setSettings($this->getSettings())->generateLabelsAndValues() ?? [], // @phpstan-ignore-line
+                'quotes' => $processed = (new HtmlEngine($value->first()->invitations()->first()))->setSettings($this->getSettings())->generateLabelsAndValues() ?? [], // @phpstan-ignore-line
+                'credits' => $processed = (new HtmlEngine($value->first()->invitations()->first()))->setSettings($this->getSettings())->generateLabelsAndValues() ?? [], // @phpstan-ignore-line
                 'payments' => $processed = (new PaymentHtmlEngine($value->first(), $value->first()->client->contacts()->first()))->setSettings($this->getSettings())->generateLabelsAndValues() ?? [], //@phpstan-ignore-line
-                'tasks' => $processed = (new HtmlEngine($value->first()->client->invoices()->first()->invitations()->first()))->setSettings($this->getSettings())->generateLabelsAndValues() ?? [],
-                'projects' => $processed = (new HtmlEngine($value->first()->client->invoices()->first()->invitations()->first()))->setSettings($this->getSettings())->generateLabelsAndValues() ?? [],
-                'purchase_orders' => $processed = (new VendorHtmlEngine($value->first()->invitations()->first()))->setSettings($this->getSettings())->generateLabelsAndValues() ?? [],
+                'tasks' => $processed = (new HtmlEngine($value->first()->client->invoices()->first()->invitations()->first()))->setSettings($this->getSettings())->generateLabelsAndValues() ?? [], // @phpstan-ignore-line
+                'projects' => $processed = (new HtmlEngine($value->first()->client->invoices()->first()->invitations()->first()))->setSettings($this->getSettings())->generateLabelsAndValues() ?? [], // @phpstan-ignore-line
+                'purchase_orders' => $processed = (new VendorHtmlEngine($value->first()->invitations()->first()))->setSettings($this->getSettings())->generateLabelsAndValues() ?? [], // @phpstan-ignore-line
                 'aging' => $processed = [],
                 default => $processed = [],
             };
@@ -676,6 +682,9 @@ class TemplateService
                         'project' => $invoice->project ? $this->transformProject($invoice->project, true) : [],
                         'actual_delivery_date' => $this->translateDate(data_get($invoice, 'e_invoice.Invoice.Delivery.0.ActualDeliveryDate', $invoice->date), $invoice->client->date_format(), $invoice->client->locale()),
                         'invoice_period' => $invoice_period,
+                        'user' => $this->userInfo($invoice->user),
+                        'assigned_user' => $invoice->assigned_user ? $this->userInfo($invoice->assigned_user) : [],
+                        'tags' => $invoice->tags->pluck('name')->values()->all(),
                     ];
 
                 });
@@ -749,7 +758,14 @@ class TemplateService
                 'net' => Number::formatMoney($credit->pivot->amount - $credit->pivot->refunded, $payment->client),
                 'is_credit' => true,
                 'date' => $this->translateDate($credit->date, $payment->client->date_format(), $payment->client->locale()),
-                'created_at' => $this->translateDate($credit->pivot->created_at, $payment->client->date_format(), $payment->client->locale()),
+                'created_at' => $this->translateDate(
+                    app(PaymentApplicationDateResolver::class)->resolveTimestamp(
+                        $credit->pivot->created_at,
+                        $payment->company->timezone()?->name ?: config('app.timezone'),
+                    ),
+                    $payment->client->date_format(),
+                    $payment->client->locale(),
+                ),
                 'updated_at' => $this->translateDate($credit->pivot->updated_at, $payment->client->date_format(), $payment->client->locale()),
                 'timestamp' => $credit->pivot->created_at->timestamp,
             ];
@@ -770,7 +786,14 @@ class TemplateService
                 'net' => Number::formatMoney($invoice->pivot->amount - $invoice->pivot->refunded, $payment->client),
                 'is_credit' => false,
                 'date' => $this->translateDate($invoice->date, $payment->client->date_format(), $payment->client->locale()),
-                'created_at' => $this->translateDate($invoice->pivot->created_at, $payment->client->date_format(), $payment->client->locale()),
+                'created_at' => $this->translateDate(
+                    app(PaymentApplicationDateResolver::class)->resolveTimestamp(
+                        $invoice->pivot->created_at,
+                        $payment->company->timezone()?->name ?: config('app.timezone'),
+                    ),
+                    $payment->client->date_format(),
+                    $payment->client->locale(),
+                ),
                 'updated_at' => $this->translateDate($invoice->pivot->updated_at, $payment->client->date_format(), $payment->client->locale()),
                 'timestamp' => $invoice->pivot->created_at->timestamp,
             ];
@@ -803,6 +826,9 @@ class TemplateService
             'client' => $this->getClient($payment),
             'paymentables' => $pivot,
             'refund_activity' => $this->getPaymentRefundActivity($payment),
+            'user' => $this->userInfo($payment->user),
+            'assigned_user' => $payment->assigned_user ? $this->userInfo($payment->assigned_user) : [],
+            'tags' => $payment->tags->pluck('name')->values()->all(),
         ];
 
     }
@@ -923,6 +949,10 @@ class TemplateService
                 'client' => $this->getClient($quote),
                 'total_tax_map' => $quote->calc()->getTotalTaxMap(),
                 'line_tax_map' => $quote->calc()->getTaxMap()->toArray(),
+                'project' => $quote->project ? $this->transformProject($quote->project, true) : [],
+                'user' => $this->userInfo($quote->user),
+                'assigned_user' => $quote->assigned_user ? $this->userInfo($quote->assigned_user) : [],
+                'tags' => $quote->tags->pluck('name')->values()->all(),
             ];
         })->toArray();
 
@@ -1006,6 +1036,9 @@ class TemplateService
                         'payments' => $payments,
                         'total_tax_map' => $credit->calc()->getTotalTaxMap(),
                         'line_tax_map' => $credit->calc()->getTaxMap()->toArray(),
+                        'user' => $this->userInfo($credit->user),
+                        'assigned_user' => $credit->assigned_user ? $this->userInfo($credit->assigned_user) : [],
+                        'tags' => $credit->tags->pluck('name')->values()->all(),
                     ];
 
                 });
@@ -1049,6 +1082,8 @@ class TemplateService
             'payment_balance' => $entity->client->payment_balance,
             'credit_balance' => $entity->client->credit_balance,
             'number' => $entity->client->number ?? '',
+            'invoice_term_days' => $entity->client->getSetting('payment_terms') ?? '',
+            'quote_term_days' => $entity->client->getSetting('valid_until') ?? '',
             'id_number' => $entity->client->id_number ?? '',
             'vat_number' => $entity->client->vat_number ?? '',
             'currency' => $entity->client->currency()->code ?? 'USD',
@@ -1059,7 +1094,9 @@ class TemplateService
             'address' => $entity->client->present()->address(),
             'shipping_address' => $entity->client->present()->shipping_address(),
             'locale' => substr($entity->client->locale(), 0, 2),
-            'location' => $entity->location ? $entity->service()->location(false) : [],
+            'location' => (method_exists($entity, 'service') && method_exists($entity->service(), 'location'))
+                                        ? $entity->service()->location(false)
+                                        : [],
         ] : [];
     }
 
@@ -1109,6 +1146,7 @@ class TemplateService
             'status' => $task->status ? $task->status->name : '',
             'user' => $this->userInfo($task->user),
             'assigned_user' => $task->assigned_user ? $this->userInfo($task->assigned_user) : [],
+            'tags' => $task->tags->pluck('name')->values()->all(),
         ] : [];
     }
 
@@ -1125,7 +1163,7 @@ class TemplateService
                 'category' => $expense->category ? $expense->category->name : '',
                 'amount' => Number::formatMoney($expense->amount, $expense->client ?? $expense->company),
                 'amount_raw' => $expense->amount,
-                'date' => $expense->date ? $this->translateDate($expense->date, $expense->client->date_format(), $expense->client->locale()) : '',
+                'date' => $expense->date ? $this->translateDate($expense->date, ($expense->client ?? $expense->company)->date_format(), ($expense->client ?? $expense->company)->locale()) : '',
                 'private_notes' => (string) $expense->private_notes ?: '',
                 'public_notes' => (string) $expense->public_notes ?: '',
                 'exchange_rate' => (float) $expense->exchange_rate,
@@ -1138,7 +1176,7 @@ class TemplateService
                 'tax_amount1' => (float) $expense->tax_amount1,
                 'tax_amount2' => (float) $expense->tax_amount2,
                 'tax_amount3' => (float) $expense->tax_amount3,
-                'payment_date' => $expense->payment_date ? $this->translateDate($expense->payment_date, $expense->client->date_format(), $expense->client->locale()) : '',
+                'payment_date' => $expense->payment_date ? $this->translateDate($expense->payment_date, ($expense->client ?? $expense->company)->date_format(), ($expense->client ?? $expense->company)->locale()) : '',
                 'transaction_reference' => $expense->transaction_reference ?: '',
                 'custom_value1' => $expense->custom_value1 ?: '',
                 'custom_value2' => $expense->custom_value2 ?: '',
@@ -1151,6 +1189,9 @@ class TemplateService
                 'vendor' => $this->getVendor($expense),
                 'project' => ($expense->project && !$nested) ? $this->transformProject($expense->project, true) : [],
                 'invoice' => $expense->invoice ? $this->processInvoices([$expense->invoice]) : [],
+                'user' => $this->userInfo($expense->user),
+                'assigned_user' => $expense->assigned_user ? $this->userInfo($expense->assigned_user) : [],
+                'tags' => $expense->tags->pluck('name')->values()->all(),
             ];
         })->toArray();
     }
@@ -1175,6 +1216,8 @@ class TemplateService
                 'created_at' => $this->translateDate($task->created_at, $task->client ? $task->client->date_format() : $task->company->date_format(), $task->client ? $task->client->locale() : $task->company->locale()),
                 'updated_at' => $this->translateDate($task->updated_at, $task->client ? $task->client->date_format() : $task->company->date_format(), $task->client ? $task->client->locale() : $task->company->locale()),
                 'date' => $task->calculated_start_date ? $this->translateDate($task->calculated_start_date, $task->client ? $task->client->date_format() : $task->company->date_format(), $task->client ? $task->client->locale() : $task->company->locale()) : '',
+                'due_date' => $task->due_date ? $this->translateDate($task->due_date, $task->client ? $task->client->date_format() : $task->company->date_format(), $task->client ? $task->client->locale() : $task->company->locale()) : '',
+                'estimated_duration' => is_null($task->estimated_duration) ? null : (int) $task->estimated_duration,
                 // 'invoice_id' => $this->encodePrimaryKey($task->invoice_id) ?: '',
                 'project' => ($task->project && !$nested) ? $this->transformProject($task->project, true) : [],
                 'time_log' => $task->processLogsExpandedNotation(),
@@ -1186,6 +1229,7 @@ class TemplateService
                 'user' => $this->userInfo($task->user),
                 'assigned_user' => $task->assigned_user ? $this->userInfo($task->assigned_user) : [],
                 'client' => $this->getClient($task),
+                'tags' => $task->tags->pluck('name')->values()->all(),
             ];
 
 
@@ -1246,7 +1290,9 @@ class TemplateService
             'user' => $this->userInfo($project->user),
             'assigned_user' => $project->assigned_user ? $this->userInfo($project->assigned_user) : [],
             'invoices' => !$nested ? $this->processInvoices($project->invoices) : [],
+            'quotes' => !$nested ? $this->processQuotes($project->quotes) : [],
             'expenses' => ($project->expenses && !$nested) ? $this->processExpenses($project->expenses, true) : [],
+            'tags' => $project->tags->pluck('name')->values()->all(),
         ];
 
     }
@@ -1322,10 +1368,53 @@ class TemplateService
                 'currency_id' => $purchase_order->currency_id ? (string) $purchase_order->currency_id : '',
                 'total_tax_map' => $purchase_order->calc()->getTotalTaxMap(),
                 'line_tax_map' => $purchase_order->calc()->getTaxMap()->toArray(),
+                'user' => $this->userInfo($purchase_order->user),
+                'assigned_user' => $purchase_order->assigned_user ? $this->userInfo($purchase_order->assigned_user) : [],
+                'tags' => $purchase_order->tags->pluck('name')->values()->all(),
             ];
 
         })->toArray();
 
+    }
+
+    
+    /**
+     * processScalars
+     *
+     * @return self
+     */
+    public function processScalars(): self
+    {
+
+        $settings = $this->getSettings();
+
+        $this->data['company'] = [
+            'city_state_postal' => $this->company->present()->cityStateZip($settings->city, $settings->state, $settings->postal_code, false) ?: ' ',
+            'postal_city_state' => $this->company->present()->cityStateZip($settings->city, $settings->state, $settings->postal_code, true) ?: ' ',
+            'postal_city' => $this->company->present()->cityStateZip($settings->city, null, $settings->postal_code, true) ?: ' ',
+            'name' => $this->company->present()->name(),
+            'classification' => $settings->classification ?: '',
+            'address1' => $settings->address1 ?: '',
+            'address2' => $settings->address2 ?: '',
+            'city' => $settings->city ?: '',
+            'state' => $settings->state ?: '',
+            'postal_code' => $settings->postal_code ?: '',
+            'country' => $this->company->country()->name ?: '',
+            'country_2' => $this->company->country()->iso_3166_2 ?: '',
+            'phone' => $settings->phone ?: '',
+            'email' => $settings->email ?: '',
+            'vat_number' => $settings->vat_number ?: '',
+            'id_number' => $settings->id_number ?: ''  ,
+            'website' => $settings->website ?: ''  ,
+            'payment_terms' => $settings->payment_terms ?: '',
+            'valid_until' => $settings->valid_until ?: '',
+            'custom1' => $this->company->custom_value1 ?: '',
+            'custom2' => $this->company->custom_value2 ?: '',
+            'custom3' => $this->company->custom_value3 ?: '',
+            'custom4' => $this->company->custom_value4 ?: '',
+        ];
+
+        return $this;
     }
 
     /**

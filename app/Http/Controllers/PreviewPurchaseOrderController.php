@@ -83,7 +83,7 @@ class PreviewPurchaseOrderController extends BaseController
                 return response()->json(['message' => ctrans('texts.invalid_design_object')], 400);
             }
 
-            $entity_obj = PurchaseOrder::query()->whereId($this->decodePrimaryKey($request->input('entity_id')))->company()->first();
+            $entity_obj = PurchaseOrder::query()->with('vendor', 'vendor.tags')->whereId($this->decodePrimaryKey($request->input('entity_id')))->company()->first();
 
             if (! $entity_obj) {
                 return $this->blankEntity();
@@ -202,18 +202,28 @@ class PreviewPurchaseOrderController extends BaseController
             return response()->json(['message' => 'Invalid custom design object'], 400);
         }
 
+        $requestDesign = $design_object['design'] ?? null;
+
+        if (! is_array($requestDesign)) {
+            return response()->json(['message' => 'Invalid custom design object'], 400);
+        }
+
         $ps = new PdfService($invitation, 'product', [
             'client' => $invitation->client ?? false,
             'vendor' => $invitation->vendor ?? false,
             "purchase_orders" => [$invitation->purchase_order],
         ]);
 
-        $ps->boot()
-        ->designer
-        ->buildFromPartials($design_object['design']);
+        $ps->bootForPreviewDesign($requestDesign);
 
-        $ps->builder
-        ->build();
+        if (isset($requestDesign['blocks'])) {
+            $ps->setJsonDesignHtml(
+                (new \App\Services\Pdf\JsonDesignService($ps, $requestDesign))->build()
+            );
+        } else {
+            $ps->designer->buildFromPartials($requestDesign);
+            $ps->builder->build();
+        }
 
 
         if (request()->query('html') == 'true') {

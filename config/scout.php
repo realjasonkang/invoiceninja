@@ -20,18 +20,6 @@ return [
 
     /*
     |--------------------------------------------------------------------------
-    | Search Index Version
-    |--------------------------------------------------------------------------
-    |
-    | This option controls which searchable payload version is returned by
-    | models when syncing records to the search index.
-    |
-    */
-
-    'index_version' => env('SEARCH_INDEX_VERSION', 'legacy'),
-
-    /*
-    |--------------------------------------------------------------------------
     | Index Prefix
     |--------------------------------------------------------------------------
     |
@@ -55,11 +43,18 @@ return [
     */
 
     // 'queue' => env('SCOUT_QUEUE', true),
-    'queue' => [
-        'connection' => env('QUEUE_CONNECTION', 'sync'),
-        'queue' => 'scout'
-    ],
+    // 'queue' => [
+    //     'connection' => env('QUEUE_CONNECTION', 'sync'),
+    //     'queue' => 'scout'
+    // ],
 
+    'queue' => env('SCOUT_QUEUE', ! is_null(env('SCOUT_DRIVER')))
+    ? [
+        'connection' => env('QUEUE_CONNECTION', 'sync'),
+        'queue' => 'scout',
+    ]
+    : false,
+    
     /*
     |--------------------------------------------------------------------------
     | Database Transactions

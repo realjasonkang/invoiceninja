@@ -20,11 +20,14 @@ use League\Csv\Writer;
 use App\Models\Company;
 use App\Models\Invoice;
 use App\Models\Payment;
+use App\Models\Paymentable;
 use App\Libraries\MultiDB;
 use App\Export\CSV\BaseExport;
 use App\Utils\Traits\MakesDates;
 use Illuminate\Support\Facades\App;
 use App\Services\Template\TemplateService;
+use App\Services\Payment\PaymentApplicationDateResolver;
+use Illuminate\Support\LazyCollection;
 
 class ClientSalesReport extends BaseExport
 {
@@ -42,6 +45,8 @@ class ClientSalesReport extends BaseExport
 
     private array $clients = [];
 
+    private array $client_groups = [];
+
     private array $invoiceData = [];
 
     private array $paymentData = [];
@@ -58,8 +63,18 @@ class ClientSalesReport extends BaseExport
     /** @var array<int, array<int, string>> CSV rows for the invoice matrix (PDF use) */
     private array $monthlyInvoiceRows = [];
 
+    private array $monthlyInvoiceHeader = [];
+
+    /** @var array<int, array{currency: string, rows: array<int, array<int, string>>}> */
+    private array $monthly_invoice_groups = [];
+
     /** @var array<int, array<int, string>> CSV rows for the payment matrix (PDF use) */
     private array $monthlyPaymentRows = [];
+
+    private array $monthlyPaymentHeader = [];
+
+    /** @var array<int, array{currency: string, rows: array<int, array<int, string>>}> */
+    private array $monthly_payment_groups = [];
 
     private const MAX_MONTHS = 24;
 
@@ -108,8 +123,6 @@ class ClientSalesReport extends BaseExport
             $this->input['report_keys'] = $this->report_keys;
         }
 
-        $this->csv->insertOne($this->buildHeader());
-
         $query = Client::query()
             ->with('contacts')
             ->where('company_id', $this->company->id)
@@ -121,12 +134,19 @@ class ClientSalesReport extends BaseExport
 
         $clientIds = $clients->pluck('id')->toArray();
         $this->invoiceData = $this->getInvoiceData($clientIds);
+        $clients = $clients->filter(function (Client $client): bool {
+            return (int) ($this->invoiceData[$client->id]['count'] ?? 0) > 0;
+        });
+
+        $clientIds = $clients->pluck('id')->toArray();
         $this->paymentData = $this->getPaymentData($clientIds);
 
         foreach ($clients as $client) {
             /** @var \App\Models\Client $client */
-            $this->csv->insertOne($this->buildRow($client));
+            $this->buildRow($client);
         }
+
+        $this->writeCsvTables();
 
         $this->resolveMonthAxis();
         $this->emitMonthlySections($clients);
@@ -179,9 +199,8 @@ class ClientSalesReport extends BaseExport
     /**
      * Fetch payment aggregates for every client in a single GROUP BY query.
      *
-     * Payments are scoped by their own `date` column so the figure reflects
-     * cash actually received in the reporting period, regardless of when the
-     * related invoice was issued. Refunded amounts are subtracted.
+     * Invoice allocations are scoped by the paymentable application date.
+     * Refunded amounts are subtracted from their allocation.
      *
      * @param  array $clientIds
      * @return array<int, array{amount_paid: float}>
@@ -192,35 +211,17 @@ class ClientSalesReport extends BaseExport
             return [];
         }
 
-        $query = Payment::query()
-            ->withTrashed()
-            ->select('client_id')
-            ->selectRaw('SUM(amount - refunded) as total_paid')
-            ->where('company_id', $this->company->id)
-            ->where('is_deleted', 0)
-            ->whereIn('client_id', $clientIds)
-            ->whereIn('status_id', [
-                Payment::STATUS_COMPLETED,
-                Payment::STATUS_PARTIALLY_REFUNDED,
-                Payment::STATUS_REFUNDED,
-            ])
-            ->groupBy('client_id');
-
-        $previous_date_key = $this->date_key;
-        $this->date_key = 'date';
-
-        try {
-            $query = $this->addDateRange($query, 'payments');
-        } finally {
-            $this->date_key = $previous_date_key;
-        }
-
         $data = [];
+        $is_all = in_array($this->input['date_range'] ?? null, ['all', 'all_time'], true);
 
-        foreach ($query->get() as $row) {
-            $data[$row->client_id] = [ // @phpstan-ignore-line
-                'amount_paid' => (float) ($row->total_paid ?? 0), // @phpstan-ignore-line
-            ];
+        foreach ($this->paymentApplications(
+            $clientIds,
+            $is_all ? null : $this->start_date,
+            $is_all ? null : $this->end_date,
+        ) as $application) {
+            $client_id = $application['client_id'];
+            $data[$client_id]['amount_paid'] = ($data[$client_id]['amount_paid'] ?? 0)
+                + $application['amount'];
         }
 
         return $data;
@@ -240,15 +241,55 @@ class ClientSalesReport extends BaseExport
             $client->number,
             $client->id_number,
             $invoiceData['count'],
-            Number::formatMoney($invoiceData['amount'], $this->company),
-            Number::formatMoney($invoiceData['balance'], $this->company),
-            Number::formatMoney($invoiceData['total_taxes'], $this->company),
-            Number::formatMoney($paymentData['amount_paid'], $this->company),
+            Number::formatMoney($invoiceData['amount'], $client),
+            Number::formatMoney($invoiceData['balance'], $client),
+            Number::formatMoney($invoiceData['total_taxes'], $client),
+            Number::formatMoney($paymentData['amount_paid'], $client),
         ];
 
-        $this->clients[] = $item;
+        $this->storeClientRow($client->currency()->code, $item);
 
         return $item;
+    }
+
+    private function storeClientRow(string $currency_code, array $row): void
+    {
+        $this->clients[] = $row;
+
+        if (!isset($this->client_groups[$currency_code])) {
+            $this->client_groups[$currency_code] = [
+                'currency' => $currency_code,
+                'clients' => [],
+            ];
+        }
+
+        $this->client_groups[$currency_code]['clients'][] = $row;
+    }
+
+    private function writeCsvTables(): void
+    {
+        if (count($this->client_groups) <= 1) {
+            $this->csv->insertOne($this->buildHeader());
+
+            foreach ($this->clients as $row) {
+                $this->csv->insertOne($row);
+            }
+
+            return;
+        }
+
+        foreach (array_values($this->client_groups) as $index => $group) {
+            if ($index > 0) {
+                $this->csv->insertOne([]);
+            }
+
+            $this->csv->insertOne([ctrans('texts.currency'), $group['currency']]);
+            $this->csv->insertOne($this->buildHeader());
+
+            foreach ($group['clients'] as $row) {
+                $this->csv->insertOne($row);
+            }
+        }
     }
 
     /**
@@ -263,7 +304,7 @@ class ClientSalesReport extends BaseExport
     private function resolveMonthAxis(): void
     {
         $dateRange = $this->input['date_range'] ?? '';
-        $unresolved = $dateRange === 'all' || $this->start_date === 'All available data' || empty($this->start_date) || empty($this->end_date);
+        $unresolved = in_array($dateRange, ['all', 'all_time'], true) || $this->start_date === 'All available data' || empty($this->start_date) || empty($this->end_date);
 
         if ($unresolved) {
             // No explicit range: derive an end date from the most recent
@@ -272,8 +313,7 @@ class ClientSalesReport extends BaseExport
             // data at all.
             $maxInvoice = Invoice::query()->withTrashed()
                 ->where('company_id', $this->company->id)->where('is_deleted', 0)->max('date');
-            $maxPayment = Payment::query()->withTrashed()
-                ->where('company_id', $this->company->id)->where('is_deleted', 0)->max('date');
+            $maxPayment = $this->latestPaymentApplicationDate();
 
             $max = max((string) $maxInvoice, (string) $maxPayment);
 
@@ -366,7 +406,7 @@ class ClientSalesReport extends BaseExport
     }
 
     /**
-     * Aggregate net payment amounts (amount - refunded) by (client_id, period).
+     * Aggregate net invoice allocations by (client_id, application period).
      *
      * @param  array<int, int> $clientIds
      * @return array<int, array<string, float>> [client_id => [Y-m => amount]]
@@ -377,35 +417,95 @@ class ClientSalesReport extends BaseExport
             return [];
         }
 
-        $period = "DATE_FORMAT(payments.date, '%Y-%m')";
-
-        $query = Payment::query()
-            ->withTrashed()
-            ->select('client_id')
-            ->selectRaw("{$period} as period")
-            ->selectRaw('SUM(amount - refunded) as total_paid')
-            ->where('company_id', $this->company->id)
-            ->where('is_deleted', 0)
-            ->whereIn('client_id', $clientIds)
-            ->whereIn('status_id', [
-                Payment::STATUS_COMPLETED,
-                Payment::STATUS_PARTIALLY_REFUNDED,
-                Payment::STATUS_REFUNDED,
-            ])
-            ->whereBetween('payments.date', [
-                $this->monthAxisStart->format('Y-m-d'),
-                $this->monthAxisEnd->format('Y-m-d'),
-            ])
-            ->groupBy('client_id')
-            ->groupByRaw($period);
-
         $matrix = [];
 
-        foreach ($query->get() as $row) {
-            $matrix[$row->client_id][$row->period] = (float) ($row->total_paid ?? 0); // @phpstan-ignore-line
+        foreach ($this->paymentApplications(
+            $clientIds,
+            $this->monthAxisStart->toDateString(),
+            $this->monthAxisEnd->toDateString(),
+        ) as $application) {
+            $client_id = $application['client_id'];
+            $period = substr($application['application_date'], 0, 7);
+            $matrix[$client_id][$period] = ($matrix[$client_id][$period] ?? 0)
+                + $application['amount'];
         }
 
         return $matrix;
+    }
+
+    /**
+     * @param array<int, int> $client_ids
+     * @return LazyCollection<int, array{client_id:int,application_date:string,amount:float}>
+     */
+    private function paymentApplications(
+        array $client_ids,
+        ?string $start_date,
+        ?string $end_date,
+    ): LazyCollection {
+        $timezone = $this->company->timezone()?->name ?: config('app.timezone');
+        $query = Paymentable::query()
+            ->with(['payment' => fn ($query) => $query->withTrashed()])
+            ->where('paymentable_type', 'invoices')
+            ->whereNull('deleted_at')
+            ->whereHas('payment', fn ($query) => $query
+                ->withTrashed()
+                ->where('company_id', $this->company->id)
+                ->where('is_deleted', false)
+                ->whereIn('client_id', $client_ids)
+                ->whereIn('status_id', [
+                    Payment::STATUS_COMPLETED,
+                    Payment::STATUS_PARTIALLY_REFUNDED,
+                    Payment::STATUS_REFUNDED,
+                ]));
+
+        if ($start_date && $end_date) {
+            [$query_start, $query_end] = app(PaymentApplicationDateResolver::class)
+                ->candidateBounds($start_date, $end_date, $timezone);
+            $query
+                ->where('created_at', '>=', $query_start)
+                ->where('created_at', '<', $query_end);
+        }
+
+        return $query
+            ->orderBy('id')
+            ->lazyById(500)
+            ->map(function (Paymentable $paymentable) use ($start_date, $end_date, $timezone): ?array {
+                $application_date = app(PaymentApplicationDateResolver::class)
+                    ->resolve($paymentable, $timezone);
+
+                if (! $application_date
+                    || ($start_date && $application_date < $start_date)
+                    || ($end_date && $application_date > $end_date)) {
+                    return null;
+                }
+
+                return [
+                    'client_id' => (int) $paymentable->payment->client_id,
+                    'application_date' => $application_date,
+                    'amount' => (float) $paymentable->amount - (float) $paymentable->refunded,
+                ];
+            })
+            ->filter()
+            ->values();
+    }
+
+    private function latestPaymentApplicationDate(): ?string
+    {
+        $paymentable = Paymentable::query()
+            ->where('paymentable_type', 'invoices')
+            ->whereNull('deleted_at')
+            ->whereHas('payment', fn ($query) => $query
+                ->withTrashed()
+                ->where('company_id', $this->company->id)
+                ->where('is_deleted', false))
+            ->orderByDesc('created_at')
+            ->orderByDesc('id')
+            ->first();
+
+        return app(PaymentApplicationDateResolver::class)->resolve(
+            $paymentable,
+            $this->company->timezone()?->name ?: config('app.timezone'),
+        );
     }
 
     /**
@@ -428,22 +528,55 @@ class ClientSalesReport extends BaseExport
         $clientIds = $clients->pluck('id')->toArray();
         $invoiceMatrix = $this->getInvoiceMonthlyMatrix($clientIds);
         $paymentMatrix = $this->getPaymentMonthlyMatrix($clientIds);
+        $monthlyClients = $this->sortClientsForMonthlySections($clients);
 
-        $this->emitMatrixSection($clients, $invoiceMatrix, ctrans('texts.invoices_by_month'), $this->monthlyInvoiceRows);
-        $this->emitMatrixSection($clients, $paymentMatrix, ctrans('texts.payments_by_month'), $this->monthlyPaymentRows);
+        $this->emitMatrixSection($monthlyClients, $invoiceMatrix, ctrans('texts.invoices_by_month'), $this->monthlyInvoiceRows, $this->monthly_invoice_groups, $this->monthlyInvoiceHeader);
+        $this->emitMatrixSection($monthlyClients, $paymentMatrix, ctrans('texts.payments_by_month'), $this->monthlyPaymentRows, $this->monthly_payment_groups, $this->monthlyPaymentHeader);
+    }
+
+    private function sortClientsForMonthlySections(\Illuminate\Database\Eloquent\Collection $clients): \Illuminate\Database\Eloquent\Collection
+    {
+        return $clients
+            ->sortBy(function (Client $client): string {
+                return $client->present()->name();
+            }, SORT_NATURAL | SORT_FLAG_CASE)
+            ->values();
+    }
+
+    /**
+     * Trim only leading months that have no data anywhere in this section.
+     *
+     * @param array<int, array<string, float>> $matrix
+     * @return array<string, string>
+     */
+    private function trimLeadingEmptyMonthAxis(array $matrix): array
+    {
+        foreach (array_keys($this->monthAxis) as $index => $ym) {
+            foreach ($matrix as $cells) {
+                if (array_key_exists($ym, $cells)) {
+                    return array_slice($this->monthAxis, $index, null, true);
+                }
+            }
+        }
+
+        return [];
     }
 
     /**
      * @param array<int, array<string, float>> $matrix
      * @param array<int, array<int, string>>   $bag    Captured by reference for PDF use.
+     * @param array<int, array{currency: string, rows: array<int, array<int, string>>}> $groupBag
+     * @param array<int, string> $headerBag
      */
-    private function emitMatrixSection(\Illuminate\Database\Eloquent\Collection $clients, array $matrix, string $title, array &$bag): void
+    private function emitMatrixSection(\Illuminate\Database\Eloquent\Collection $clients, array $matrix, string $title, array &$bag, array &$groupBag, array &$headerBag): void
     {
         $this->csv->insertOne([]);
         $this->csv->insertOne([$title]);
 
-        $header = array_merge([ctrans('texts.client_name')], array_values($this->monthAxis));
-        $this->csv->insertOne($header);
+        $monthAxis = $this->trimLeadingEmptyMonthAxis($matrix);
+        $headerBag = array_values($monthAxis);
+        $header = array_merge([ctrans('texts.client_name')], $headerBag);
+        $rowsByCurrency = [];
 
         foreach ($clients as $client) {
             /** @var \App\Models\Client $client */
@@ -453,16 +586,51 @@ class ClientSalesReport extends BaseExport
                 continue;
             }
 
-            $row = [$client->present()->name()];
+            /** @var array<int, string> $row */
+            $row = [(string) $client->present()->name()];
 
-            foreach (array_keys($this->monthAxis) as $ym) {
+            foreach (array_keys($monthAxis) as $ym) {
                 $row[] = isset($cells[$ym])
-                    ? Number::formatMoney($cells[$ym], $this->company)
+                    ? Number::formatMoney($cells[$ym], $client)
                     : '';
             }
 
-            $this->csv->insertOne($row);
+            $currency_code = (string) $client->currency()->code;
+
+            if (! isset($rowsByCurrency[$currency_code])) {
+                $rowsByCurrency[$currency_code] = [
+                    'currency' => $currency_code,
+                    'rows' => [],
+                ];
+            }
+
+            $rowsByCurrency[$currency_code]['rows'][] = $row;
             $bag[] = $row;
+        }
+
+        $groupBag = array_values($rowsByCurrency);
+
+        if (count($rowsByCurrency) <= 1) {
+            $this->csv->insertOne($header);
+
+            foreach ($bag as $row) {
+                $this->csv->insertOne($row);
+            }
+
+            return;
+        }
+
+        foreach (array_values($rowsByCurrency) as $index => $group) {
+            if ($index > 0) {
+                $this->csv->insertOne([]);
+            }
+
+            $this->csv->insertOne([ctrans('texts.currency'), $group['currency']]);
+            $this->csv->insertOne($header);
+
+            foreach ($group['rows'] as $row) {
+                $this->csv->insertOne($row);
+            }
         }
     }
 
@@ -474,13 +642,18 @@ class ClientSalesReport extends BaseExport
 
         $data = [
             'clients' => $this->clients,
+            'client_groups' => array_values($this->client_groups),
             'company_logo' => $this->company->present()->logo(),
             'company_name' => $this->company->present()->name(),
             'created_on' => $this->translateDate(now()->format('Y-m-d'), $this->company->date_format(), $this->company->locale()),
             'created_by' => $user_name,
             'monthly_header' => array_values($this->monthAxis),
+            'monthly_invoice_header' => $this->monthlyInvoiceHeader,
+            'monthly_payment_header' => $this->monthlyPaymentHeader,
             'monthly_invoices' => $this->monthlyInvoiceRows,
             'monthly_payments' => $this->monthlyPaymentRows,
+            'monthly_invoice_groups' => array_values($this->monthly_invoice_groups),
+            'monthly_payment_groups' => array_values($this->monthly_payment_groups),
             'monthly_skipped' => $this->monthlySkipped,
         ];
 

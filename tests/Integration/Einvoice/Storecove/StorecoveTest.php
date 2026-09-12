@@ -85,7 +85,7 @@ class StorecoveTest extends TestCase
         $settings->id_number = $params['company_id_number'] ?? '';
         $settings->classification = $params['company_classification'] ?? 'business';
         $settings->country_id = Country::where('iso_3166_2', $params['company_country'] ?? 'DE')->first()->id;
-        $settings->email = $this->faker->safeEmail();
+        $settings->email = uniqid('testuser') . '@gmail.com';
         $settings->currency_id = '3';
 
         $tax_data = new TaxModel();
@@ -146,7 +146,7 @@ class StorecoveTest extends TestCase
             'user_id' => $client->user_id,
             'first_name' => $this->faker->firstName(),
             'last_name' => $this->faker->lastName(),
-            'email' => $this->faker->safeEmail()
+            'email' => uniqid('testuser') . '@gmail.com'
         ]);
 
         $invoice = \App\Models\Invoice::factory()->create([
@@ -389,6 +389,7 @@ class StorecoveTest extends TestCase
             'company_country' => 'DE',
             'client_country' => 'DE',
             'client_vat' => '',
+            'client_id_number' => '12345/67890',
             'classification' => 'individual',
             'has_valid_vat' => false,
             'over_threshold' => true,
@@ -1100,7 +1101,7 @@ class StorecoveTest extends TestCase
             'custom_value1' => '2024-07-22 10:00:00',
             'custom_value2' => 'blue',
             'custom_value3' => 'sampleword',
-            'custom_value4' => 'test@example.com',
+            'custom_value4' => 'test@gmail.com',
             'address1' => '123',
             'address2' => 'Test Street 45',
             'city' => 'Zurich',
@@ -1138,7 +1139,7 @@ class StorecoveTest extends TestCase
         $settings->state = 'Lazio';
         $settings->postal_code = '00187';
         $settings->phone = '06 1234567';
-        $settings->email = \Illuminate\Support\Str::random(32)."@example.com";
+        $settings->email = \Illuminate\Support\Str::random(32)."@gmail.com";
         $settings->country_id = '380'; // Italy's ISO country code
         $settings->vat_number = 'IT92443356490'; // Italian VAT number
         $settings->id_number = 'RM 123456'; // Typical Italian company registration format
@@ -1301,7 +1302,7 @@ class StorecoveTest extends TestCase
         $settings->state = 'Berlin';
         $settings->postal_code = '10115';
         $settings->phone = '030 1234567';
-        $settings->email = \Illuminate\Support\Str::random(32)."@example.com";
+        $settings->email = \Illuminate\Support\Str::random(32)."@gmail.com";
         $settings->country_id = '276'; // Germany's ISO country code
         $settings->vat_number = 'DE123456789';
         $settings->id_number = 'HRB 98765';
@@ -1409,7 +1410,7 @@ class StorecoveTest extends TestCase
         $settings->state = 'Madrid';
         $settings->postal_code = '28013';
         $settings->phone = '030 1234567';
-        $settings->email = \Illuminate\Support\Str::random(32)."@example.com";
+        $settings->email = \Illuminate\Support\Str::random(32)."@gmail.com";
         $settings->country_id = '724'; // Germany's ISO country code
         $settings->vat_number = 'ESB16645678';
         $settings->id_number = 'HRB 12345';
@@ -1517,7 +1518,7 @@ class StorecoveTest extends TestCase
         $settings->state = 'Île-de-France';
         $settings->postal_code = '75002';
         $settings->phone = '01 23456789';
-        $settings->email = \Illuminate\Support\Str::random(32)."@example.com";
+        $settings->email = \Illuminate\Support\Str::random(32)."@gmail.com";
         $settings->country_id = '250'; // France's ISO country code
         $settings->vat_number = 'FR82345678911';
         $settings->id_number = '12345678900010';
@@ -1559,7 +1560,7 @@ class StorecoveTest extends TestCase
           'custom_value1' => '2024-07-22 10:00:00',
           'custom_value2' => 'bleu',
           'custom_value3' => 'motexemple',
-          'custom_value4' => 'test@example.com',
+          'custom_value4' => 'test@gmail.com',
           'address1' => '123 Rue de l\'Exemple',
           'address2' => '2ème étage, Bureau 45',
           'city' => 'Paris',
@@ -1628,7 +1629,7 @@ class StorecoveTest extends TestCase
         $settings->state = 'Vienna';
         $settings->postal_code = '1010';
         $settings->phone = '+43 1 23456789';
-        $settings->email = \Illuminate\Support\Str::random(32)."@example.com";
+        $settings->email = \Illuminate\Support\Str::random(32)."@gmail.com";
         $settings->country_id = '40'; // Austria's ISO country code
         $settings->vat_number = 'ATU92335648';
         $settings->id_number = 'FN 123456x';
@@ -1670,7 +1671,7 @@ class StorecoveTest extends TestCase
           'custom_value1' => '2024-07-22 10:00:00',
           'custom_value2' => 'blau',
           'custom_value3' => 'musterwort',
-          'custom_value4' => 'test@example.com',
+          'custom_value4' => 'test@gmail.com',
           'address1' => 'Musterstraße 123',
           'address2' => '2. Etage, Büro 45',
           'city' => 'Vienna',
@@ -1737,7 +1738,7 @@ class StorecoveTest extends TestCase
         $settings->state = 'Bucharest';
         $settings->postal_code = '010101';
         $settings->phone = '021 1234567';
-        $settings->email = \Illuminate\Support\Str::random(32)."@example.com";
+        $settings->email = \Illuminate\Support\Str::random(32)."@gmail.com";
         $settings->country_id = '642'; // Romania's ISO country code
         $settings->vat_number = 'RO92443356490'; // Romanian VAT number format
         $settings->id_number = 'B12345678'; // Typical Romanian company registration format
@@ -2301,6 +2302,71 @@ class StorecoveTest extends TestCase
     }
 
     /**
+     * The Storecove adapter must read the client's id_number from the Client model
+     * at transform time — not a stale value from setup only.
+     */
+    public function testStorecoveDocumentAccountingCustomerPartyUsesClientModelIdNumber(): void
+    {
+        $this->routing_id = 290868;
+
+        $scenario = [
+            'company_vat' => '',
+            'company_id_number' => 'T08GA0028A',
+            'company_country' => 'SG',
+            'company_classification' => 'business',
+            'client_country' => 'BE',
+            'client_vat' => '',
+            'client_id_number' => '9999999999',
+            'classification' => 'business',
+            'has_valid_vat' => false,
+            'over_threshold' => false,
+            'legal_entity_id' => 290868,
+            'is_tax_exempt' => false,
+        ];
+
+        $data = $this->setupTestData($scenario);
+        $invoice = $data['invoice'];
+        $invoice = $invoice->calc()->getInvoice();
+        $invoice->save();
+
+        $expectedEnterpriseNumber = 'BE0202239951';
+        $client = $invoice->client;
+        $this->assertNotSame(
+            $expectedEnterpriseNumber,
+            $client->id_number,
+            'fixture id_number must differ from the value we assign on the model'
+        );
+
+        $client->id_number = $expectedEnterpriseNumber;
+        $client->vat_number = '';
+        $client->saveQuietly();
+        $invoice->unsetRelation('client');
+        $invoice->load('client');
+
+        $storecove = new Storecove();
+        $adapter = $storecove->adapter;
+        $adapter->transform($invoice)->decorate();
+
+        $customerParty = $adapter->getInvoice()->getAccountingCustomerParty();
+        $publicIdentifiers = $customerParty->getPublicIdentifiers();
+
+        nlog($publicIdentifiers);
+        $this->assertNotEmpty($publicIdentifiers);
+        $pi = $publicIdentifiers[0];
+        $this->assertSame('BE:EN', $pi->getScheme());
+        // $this->assertSame(
+        //     $expectedEnterpriseNumber,
+        //     $pi->getId(),
+        //     'accountingCustomerParty.publicIdentifiers must reflect Client::id_number from the invoice model'
+        // );
+        
+        // ^(?:0|1)\\d{9}$
+
+        $this->assertEquals('0202239951',$pi->getId());
+        
+    }
+
+    /**
      * testBeClientWithIdNumberUsesEnScheme
      *
      * BE routing is BE:EN (enterprise number). When the client has an id_number
@@ -2501,7 +2567,7 @@ class StorecoveTest extends TestCase
             'BE vat fallback'   => ['BE', 'business', 'BE1000000417', '', '', 'BE:EN', '1000000417'], // BE prefix stripped from vat_number fallback
             'SE with id'        => ['SE', 'business', 'SE123456789012', '1234567890', '', 'SE:ORGNR', '1234567890'],
             'SE vat fallback'   => ['SE', 'business', 'SE123456789012', '', '', null, null], // VAT doesn't match SE:ORGNR
-            'DK with id'        => ['DK', 'business', 'DK12345678', 'DK12345678', '', 'DK:DIGST', 'DK12345678'],
+            'DK with id'        => ['DK', 'business', 'DK12345678', 'DK12345678', '', 'DK:DIGST', '12345678'],
             'EE with id'        => ['EE', 'business', 'EE123456789', '12345678', '', 'EE:CC', '12345678'],
             'NO with id'        => ['NO', 'business', 'NO123456789', '123456789', '', 'NO:ORG', '123456789'],
             'FI with id'        => ['FI', 'business', 'FI12345678', '123456789012', '', 'FI:OVT', '123456789012'],
@@ -2520,8 +2586,11 @@ class StorecoveTest extends TestCase
             'IN business'       => ['IN', 'business', '22AAAAA0000A1Z5', '', '', 'IN:GSTIN', '22AAAAA0000A1Z5'],
             'SA business'       => ['SA', 'business', '1234567890', '', '', 'SA:TIN', '1234567890'],
 
-            // Government with composite/fixed endpoints — falls back to identifier scheme (column 1)
-            'AT government'     => ['AT', 'government', '', 'AT:GOV-ID', '', 'AT:GOV', 'AT:GOV-ID'],
+            // Government with composite/fixed endpoints.
+            // AT:GOV always routes to fixed endpoint "b" per Storecove docs — the client's
+            // id_number flows to customerAssignedAccountIdValue on the supplier party, not here.
+            // SG:UEN composites resolve to the identifier scheme (column 1) with the client's id.
+            'AT government'     => ['AT', 'government', '', 'AT:GOV-ID', '', 'AT:GOV', 'b'],
             'SG government'     => ['SG', 'government', '', 'T08GA0028A', '', 'SG:UEN', 'T08GA0028A'],
 
             // IT:CUUO uses routing_id

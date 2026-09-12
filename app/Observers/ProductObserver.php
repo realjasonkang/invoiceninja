@@ -15,6 +15,7 @@ namespace App\Observers;
 use App\Jobs\Util\WebhookHandler;
 use App\Models\Product;
 use App\Models\Webhook;
+use App\Services\Quickbooks\QuickbooksBatchCollector;
 
 class ProductObserver
 {
@@ -29,6 +30,8 @@ class ProductObserver
     public function created(Product $product)
     {
         $subscriptions = Webhook::where('company_id', $product->company_id)
+            ->where('is_deleted', false)
+            ->whereNull('deleted_at')
             ->where('event_id', Webhook::EVENT_CREATE_PRODUCT)
             ->exists();
 
@@ -44,10 +47,11 @@ class ProductObserver
            && $product->company->shouldPushToQuickbooks('product')
            && empty(\App\Services\Quickbooks\QuickbooksService::$importing[$product->company_id])) {
 
-            \App\Jobs\Quickbooks\PushToQuickbooks::dispatch(
+            QuickbooksBatchCollector::collect(
                 'product',
                 $product->id,
-                $product->company->db
+                $product->company->db,
+                $product->company_id,
             );
 
         }
@@ -73,6 +77,8 @@ class ProductObserver
 
 
         $subscriptions = Webhook::where('company_id', $product->company_id)
+            ->where('is_deleted', false)
+            ->whereNull('deleted_at')
             ->where('event_id', $event)
             ->exists();
 
@@ -84,10 +90,11 @@ class ProductObserver
            && $product->company->shouldPushToQuickbooks('product')
            && empty(\App\Services\Quickbooks\QuickbooksService::$importing[$product->company_id])) {
 
-            \App\Jobs\Quickbooks\PushToQuickbooks::dispatch(
+            QuickbooksBatchCollector::collect(
                 'product',
                 $product->id,
-                $product->company->db
+                $product->company->db,
+                $product->company_id,
             );
 
         }
@@ -107,6 +114,8 @@ class ProductObserver
         }
 
         $subscriptions = Webhook::where('company_id', $product->company_id)
+            ->where('is_deleted', false)
+            ->whereNull('deleted_at')
             ->where('event_id', Webhook::EVENT_ARCHIVE_PRODUCT)
             ->exists();
 

@@ -20,6 +20,7 @@ use App\DataMapper\CompanySettings;
 use App\Services\EDocument\Gateway\Storecove\Storecove;
 use App\Services\EDocument\Gateway\Storecove\StorecoveProxy;
 use App\Services\EDocument\Gateway\Storecove\StorecoveC5;
+use App\Services\EDocument\Gateway\Storecove\LegalEntityService;
 use Illuminate\Foundation\Testing\DatabaseTransactions;
 use Illuminate\Http\Client\Response;
 use Illuminate\Routing\Middleware\ThrottleRequests;
@@ -48,6 +49,7 @@ class StorecoveProxyTest extends TestCase
 
     private StorecoveProxy $proxy;
     private Storecove $mockStorecove;
+    private LegalEntityService $mockLegalEntity;
     private Company $testCompany;
 
     protected function setUp(): void
@@ -93,6 +95,9 @@ class StorecoveProxyTest extends TestCase
 
         $mockC5 = Mockery::mock(StorecoveC5::class);
         $this->mockStorecove->c5 = $mockC5;
+
+        $this->mockLegalEntity = Mockery::mock(LegalEntityService::class);
+        $this->mockStorecove->legalEntity = $this->mockLegalEntity;
 
         $this->proxy = new StorecoveProxy($this->mockStorecove);
         $this->proxy->setCompany($this->testCompany);
@@ -252,9 +257,15 @@ class StorecoveProxyTest extends TestCase
             ),
         ]);
 
-        $result = $this->proxy->setup(['country' => 'DE', 'acts_as_sender' => true, 'acts_as_receiver' => true]);
+        $result = $this->proxy->setup([
+            'country' => 'DE',
+            'acts_as_sender' => true,
+            'acts_as_receiver' => true,
+            'tenant_id' => 'caller-controlled-company-key',
+        ]);
 
         $this->assertEquals(290868, $result['legal_entity_id']);
+        Http::assertSent(fn($request): bool => $request['tenant_id'] === $this->testCompany->company_key);
     }
 
     public function testSetupMergesCompanyDefaults(): void
@@ -378,9 +389,19 @@ class StorecoveProxyTest extends TestCase
     {
         $this->setHosted();
 
-        $this->mockStorecove
+        $this->testCompany->legal_entity_id = 290868;
+        $this->testCompany->save();
+
+        $this->mockLegalEntity
             ->shouldReceive('addAdditionalTaxIdentifier')
-            ->with(290868, 'FRAA123456789', 'FR:VAT')
+            ->withArgs(function ($legalEntityId, $data) {
+                return $legalEntityId === 290868
+                    && ($data['country'] ?? null) === 'FR'
+                    && ($data['vat_number'] ?? null) === 'FRAA123456789'
+                    && ($data['identifier'] ?? null) === 'FRAA123456789'
+                    && ($data['scheme'] ?? null) === 'FR:VAT'
+                    && ($data['legal_entity_id'] ?? null) === 290868;
+            })
             ->once()
             ->andReturn(['id' => 42, 'identifier' => 'FRAA123456789']);
 
@@ -468,11 +489,11 @@ class StorecoveProxyTest extends TestCase
 
         $this->mockStorecove->c5
             ->shouldReceive('activate')
-            ->with(290868, '01234567890', 'John Doe', 'john@example.com')
+            ->with(290868, '01234567890', 'John Doe', 'john@gmail.com')
             ->once()
             ->andReturn(['status' => 'activated']);
 
-        $result = $this->proxy->c5Activate('John Doe', 'john@example.com');
+        $result = $this->proxy->c5Activate('John Doe', 'john@gmail.com');
 
         $this->assertEquals('activated', $result['status']);
     }
@@ -486,7 +507,7 @@ class StorecoveProxyTest extends TestCase
             ->once()
             ->andReturn($this->makeMockResponse(400, ['error' => 'Invalid UEN']));
 
-        $result = $this->proxy->c5Activate('John Doe', 'john@example.com');
+        $result = $this->proxy->c5Activate('John Doe', 'john@gmail.com');
 
         $this->assertEquals('error', $result['status']);
     }
@@ -499,7 +520,7 @@ class StorecoveProxyTest extends TestCase
             '*/api/einvoice/peppol/sg/c5/activate' => Http::response(['status' => 'activated'], 200),
         ]);
 
-        $result = $this->proxy->c5Activate('John Doe', 'john@example.com');
+        $result = $this->proxy->c5Activate('John Doe', 'john@gmail.com');
 
         $this->assertEquals('activated', $result['status']);
     }
@@ -510,11 +531,11 @@ class StorecoveProxyTest extends TestCase
 
         $this->mockStorecove->c5
             ->shouldReceive('deactivate')
-            ->with(290868, '01234567890', 'John Doe', 'john@example.com')
+            ->with(290868, '01234567890', 'John Doe', 'john@gmail.com')
             ->once()
             ->andReturn(['status' => 'deactivated']);
 
-        $result = $this->proxy->c5Deactivate('John Doe', 'john@example.com');
+        $result = $this->proxy->c5Deactivate('John Doe', 'john@gmail.com');
 
         $this->assertEquals('deactivated', $result['status']);
     }
@@ -555,7 +576,7 @@ class StorecoveProxyTest extends TestCase
             '*/api/einvoice/peppol/sg/c5/activate' => Http::response([], 404),
         ]);
 
-        $result = $this->proxy->c5Activate('John Doe', 'john@example.com');
+        $result = $this->proxy->c5Activate('John Doe', 'john@gmail.com');
 
         $this->assertEquals('error', $result['status']);
         $this->assertEquals(503, $result['code']);
@@ -570,7 +591,7 @@ class StorecoveProxyTest extends TestCase
             '*/api/einvoice/peppol/sg/c5/deactivate' => Http::response([], 404),
         ]);
 
-        $result = $this->proxy->c5Deactivate('John Doe', 'john@example.com');
+        $result = $this->proxy->c5Deactivate('John Doe', 'john@gmail.com');
 
         $this->assertEquals('error', $result['status']);
         $this->assertEquals(503, $result['code']);

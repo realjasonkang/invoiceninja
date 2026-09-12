@@ -12,8 +12,13 @@
 
 namespace App\Services\EDocument\Gateway\Storecove;
 
+use App\Services\EDocument\UblDocumentKind;
+use App\Services\EDocument\UblDocumentKindMismatchException;
+use App\Services\EDocument\UblXmlEncoder;
 use App\Services\EDocument\Standards\Peppol;
+use App\Services\EDocument\Standards\Peppol\CountryFactory;
 use App\Services\EDocument\Gateway\Storecove\NexusResolver;
+use App\Services\EDocument\Gateway\Storecove\UblToStorecoveCreditLineMapper;
 use Symfony\Component\Serializer\Serializer;
 use Symfony\Component\Serializer\Encoder\XmlEncoder;
 use Symfony\Component\Serializer\Encoder\JsonEncoder;
@@ -46,12 +51,14 @@ class StorecoveAdapter
 
     private bool $has_error = false;
 
+    private UblDocumentKind $documentKind = UblDocumentKind::Invoice;
+
     /**
-     * Returns the transformed Storecove invoice model.
+     * Returns the transformed Storecove invoice or credit model.
      *
-     * @return Invoice
+     * @return Invoice|Credit
      */
-    public function getInvoice(): Invoice
+    public function getInvoice(): Invoice|Credit
     {
         return $this->storecove_invoice;
     }
@@ -115,7 +122,7 @@ class StorecoveAdapter
     public function transform(\App\Models\Invoice|\App\Models\Credit $invoice): self
     {
         $peppol = (new Peppol($invoice))->run();
-        return $this->transformFromPeppol($invoice, $peppol->getDocument(), $peppol->isCreditNote());
+        return $this->transformFromPeppol($invoice, $peppol->getDocument(), $peppol->getDocumentKind(), $peppol->toXml());
     }
 
     /**
@@ -126,38 +133,25 @@ class StorecoveAdapter
      *
      * @param  \App\Models\Invoice|\App\Models\Credit $invoice
      * @param  \InvoiceNinja\EInvoice\Models\Peppol\Invoice|\InvoiceNinja\EInvoice\Models\Peppol\CreditNote $peppolDocument
-     * @param  bool $isCreditNote
+     * @param  UblDocumentKind $documentKind
+     * @param  string|null $validatedUblXml Schematron-valid UBL bytes; when set, used instead of re-encoding $peppolDocument
      * @return self
      */
     public function transformFromPeppol(
         \App\Models\Invoice|\App\Models\Credit $invoice,
         \InvoiceNinja\EInvoice\Models\Peppol\Invoice|\InvoiceNinja\EInvoice\Models\Peppol\CreditNote $peppolDocument,
-        bool $isCreditNote = false,
+        UblDocumentKind $documentKind,
+        ?string $validatedUblXml = null,
     ): self {
         try {
             $this->ninja_invoice = $invoice;
+            $this->documentKind = $documentKind;
             $serializer = $this->getSerializer();
 
+            $this->assertDocumentKindMatchesPeppolDocument($documentKind, $peppolDocument);
+
             $e = new \InvoiceNinja\EInvoice\EInvoice();
-            $xml = $e->encode($peppolDocument, 'xml');
-
-            // Wrap with proper XML namespace declarations
-            if ($isCreditNote || $peppolDocument instanceof \InvoiceNinja\EInvoice\Models\Peppol\CreditNote) {
-                $prefix = '<?xml version="1.0" encoding="UTF-8"?>
-<CreditNote xmlns:cac="urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2"
-    xmlns:cbc="urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2"
-    xmlns="urn:oasis:names:specification:ubl:schema:xsd:CreditNote-2">';
-                $suffix = '</CreditNote>';
-            } else {
-                $prefix = '<?xml version="1.0" encoding="UTF-8"?>
-<Invoice xmlns:cac="urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2"
-    xmlns:cbc="urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2"
-    xmlns="urn:oasis:names:specification:ubl:schema:xsd:Invoice-2">';
-                $suffix = '</Invoice>';
-            }
-
-            $xml = str_ireplace(['\n', '<?xml version="1.0"?>'], ['', $prefix], $xml);
-            $xml .= $suffix;
+            $xml = $validatedUblXml ?? $this->encodePeppolDocumentToXml($peppolDocument, $documentKind, $e);
 
             $context = [
                 DateTimeNormalizer::FORMAT_KEY => 'Y-m-d',
@@ -166,19 +160,38 @@ class StorecoveAdapter
 
             $decoded = $e->decode('Peppol', $xml, 'xml');
 
-            $parent = ($invoice instanceof \App\Models\Credit || $decoded instanceof \InvoiceNinja\EInvoice\Models\Peppol\CreditNote)
+            $this->assertDocumentKindMatchesPeppolDocument($documentKind, $decoded);
+
+            $parent = $documentKind->isCreditNote()
                 ? Credit::class
                 : Invoice::class;
 
             $encoded = $e->encode($decoded, 'json');
             $this->storecove_invoice = $serializer->deserialize($encoded, $parent, 'json', $context);
 
+            $this->hydrateAllowanceChargeIndicatorsFromUblXml($xml);
+
+
+            $client_country_code = $invoice->client->country->iso_3166_2;
+            $nexus_vat_number = isset($invoice->company->tax_data->regions->EU->subregions->{$client_country_code}->vat_number) 
+                                && strlen($invoice->company->tax_data->regions->EU->subregions->{$client_country_code}->vat_number) > 1 
+                                ? true
+                                : false;
+            
+            if($nexus_vat_number){
+                $this->storecove_invoice->setConsumerTaxMode(true);
+            }
+
             $nexusResolver = new NexusResolver($invoice, $this->storecove_invoice, $this->storecove->router);
             $nexusResolver->resolve();
+
             $this->nexus = $nexusResolver->getNexus();
+
             foreach ($nexusResolver->getErrors() as $error) {
                 $this->addError($error);
             }
+        } catch (UblDocumentKindMismatchException $e) {
+            throw $e;
         } catch (\Throwable $th) {
 
             $this->addError($th->getMessage());
@@ -210,6 +223,10 @@ class StorecoveAdapter
             return $this;
         }
 
+        $isCredit = $this->documentKind->isCreditNote();
+
+        $mapper = new UblToStorecoveCreditLineMapper();
+
         //set all taxmap countries - resolve the taxing country
         $lines = $this->storecove_invoice->getInvoiceLines();
 
@@ -227,8 +244,12 @@ class StorecoveAdapter
 
             if (isset($line->allowance_charges)) {
                 foreach ($line->allowance_charges as &$allowance) {
-                    if ($allowance->reason == ctrans('texts.discount')) {
-                        $allowance->amount_excluding_tax = $allowance->amount_excluding_tax * -1;
+                    if ($allowance->reason == "Discount" && !is_null($allowance->amount_excluding_tax)) {
+                        $allowance->amount_excluding_tax = $mapper->mapLineAllowanceAmount(
+                            $allowance,
+                            $line->item_price ?? 0,
+                            $isCredit,
+                        );
                     }
 
 
@@ -288,8 +309,11 @@ class StorecoveAdapter
             unset($tax);
 
 
-            if ($allowance->reason == ctrans('texts.discount')) {
-                $allowance->amount_excluding_tax = $allowance->amount_excluding_tax * -1;
+            if (! is_null($allowance->amount_excluding_tax)) {
+                $allowance->amount_excluding_tax = $mapper->mapDocumentAllowanceOrChargeAmount(
+                    $allowance,
+                    $isCredit,
+                );
             }
 
             $allowance->setTaxesDutiesFees($taxes);
@@ -306,30 +330,22 @@ class StorecoveAdapter
 
         $client = $this->ninja_invoice->client;
         $country = $client->country->iso_3166_2;
-        $classification = $client->classification ?? 'business';
-        $router = $this->storecove->router->setInvoice($this->ninja_invoice);
+        $router = $this->storecove->router;
 
-        $resolved = $this->resolvePublicIdentifier($router, $client, $country, $classification);
+        $handler = CountryFactory::make($country);
+        $identifierPairs = $handler->storecoveCustomerPartyPublicIdentifiers($client, $this->ninja_invoice, $router);
 
-        if ($resolved) {
-            $pi = new \App\Services\EDocument\Gateway\Storecove\Models\PublicIdentifiers($resolved['scheme'], $resolved['id']);
-            $accounting_customer_party->addPublicIdentifiers($pi);
+        foreach ($identifierPairs as $pair) {
+            $accounting_customer_party->addPublicIdentifiers(
+                new \App\Services\EDocument\Gateway\Storecove\Models\PublicIdentifiers($pair['scheme'], $pair['id'])
+            );
+        }
 
-            // For countries where the tax scheme differs from the routing scheme (e.g. FI:OVT + FI:VAT,
-            // BE:EN + BE:VAT), Storecove requires a VAT-scheme identifier on the receiver when the
-            // invoice contains VAT or a taxExemptReason.
-            $taxScheme = $router->resolveTaxScheme($country, $classification);
-            if (!empty($taxScheme) && $taxScheme !== $resolved['scheme']) {
-                $vatRaw = trim($client->vat_number ?? '');
-                if (strlen($vatRaw) > 1 && $router->matchesSchemeFormat($taxScheme, $vatRaw)) {
-                    $accounting_customer_party->addPublicIdentifiers(
-                        new \App\Services\EDocument\Gateway\Storecove\Models\PublicIdentifiers($taxScheme, $vatRaw)
-                    );
-                }
-            }
-
+        if (count($identifierPairs) > 0) {
             $this->storecove_invoice->setAccountingCustomerParty($accounting_customer_party);
         }
+
+        $classification = $client->classification ?? 'business';
 
         // AT government: the supplier must be identified via customerAssignedAccountIdValue
         // on the accountingSupplierParty.party. Storecove uses this to look up the actual
@@ -345,129 +361,103 @@ class StorecoveAdapter
             }
         }
 
+        $this->storecove_invoice = $handler->decorateStorecoveDocument(
+            $this->storecove_invoice,
+            $this->ninja_invoice,
+        );
+
         return $this;
     }
 
     /**
-     * Resolves the correct scheme + cleaned identifier for the customer's publicIdentifiers.
-     *
-     * Uses resolveRouting() (column 3) to determine the routing scheme, then picks
-     * the best available value from the client record:
-     *  - :VAT schemes       → prefer vat_number, fall back to id_number
-     *  - Non-VAT schemes    → prefer id_number, fall back to vat_number
-     *  - GLN                → always routing_id
-     *  - IT:CUUO            → always routing_id
-     *  - Email              → skip (no publicIdentifier)
-     *  - Composite (0195:x) → fall back to identifier scheme; use centralised endpoint ID if no client match
-     *
-     * @return array{scheme: string, id: string}|null
+     * Encode a Peppol model to wrapped UBL XML (fallback when validated bytes are unavailable).
      */
-    private function resolvePublicIdentifier(StorecoveRouter $router, $client, string $country, string $classification): ?array
+    private function encodePeppolDocumentToXml(
+        \InvoiceNinja\EInvoice\Models\Peppol\Invoice|\InvoiceNinja\EInvoice\Models\Peppol\CreditNote $peppolDocument,
+        UblDocumentKind $documentKind,
+        \InvoiceNinja\EInvoice\EInvoice $e,
+    ): string {
+        $this->assertDocumentKindMatchesPeppolDocument($documentKind, $peppolDocument);
+
+        return UblXmlEncoder::wrap($e->encode($peppolDocument, 'xml'), $documentKind);
+    }
+
+    /**
+     * @param  \InvoiceNinja\EInvoice\Models\Peppol\Invoice|\InvoiceNinja\EInvoice\Models\Peppol\CreditNote $peppolDocument
+     */
+    private function assertDocumentKindMatchesPeppolDocument(
+        UblDocumentKind $documentKind,
+        \InvoiceNinja\EInvoice\Models\Peppol\Invoice|\InvoiceNinja\EInvoice\Models\Peppol\CreditNote $peppolDocument,
+    ): void {
+        $documentIsCreditNote = $peppolDocument instanceof \InvoiceNinja\EInvoice\Models\Peppol\CreditNote;
+
+        if ($documentKind->isCreditNote() !== $documentIsCreditNote) {
+            throw new UblDocumentKindMismatchException(sprintf(
+                'UblDocumentKind::%s does not match Peppol %s document.',
+                $documentKind->name,
+                $documentIsCreditNote ? 'CreditNote' : 'Invoice',
+            ));
+        }
+    }
+
+    /**
+     * The EInvoice JSON roundtrip can lose line-level AllowanceCharge/ChargeIndicator.
+     * Re-read line- and document-level AllowanceCharge/ChargeIndicator from UBL bytes.
+     */
+    private function hydrateAllowanceChargeIndicatorsFromUblXml(string $xml): void
     {
-        $scheme = $router->resolveRouting($country, $classification);
-
-        if (empty($scheme)) {
-            return null;
+        $dom = new \DOMDocument();
+        if (!@$dom->loadXML($xml)) {
+            return;
         }
 
-        // Email-routed countries (IN, SA, IT consumer) — routing goes via email,
-        // but Storecove still requires a tax identifier in publicIdentifiers.
-        if ($scheme === 'Email') {
-            $scheme = $router->resolveTaxScheme($country, $classification);
-            if (empty($scheme)) {
-                return null;
+        $cacNs = 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2';
+        $cbcNs = 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2';
+        $lineNsNames = ['CreditNoteLine', 'InvoiceLine'];
+
+        $lineIndicators = [];
+        foreach ($lineNsNames as $lineName) {
+            foreach ($dom->getElementsByTagNameNS($cacNs, $lineName) as $lineNode) {
+                $indicators = [];
+                foreach ($lineNode->getElementsByTagNameNS($cacNs, 'AllowanceCharge') as $acNode) {
+                    foreach ($acNode->getElementsByTagNameNS($cbcNs, 'ChargeIndicator') as $ciNode) {
+                        $indicators[] = trim($ciNode->textContent) ?: 'false';
+                    }
+                }
+                $lineIndicators[] = $indicators;
             }
         }
 
-        // Composite fixed endpoints (e.g. "0195:SGUENT08GA0028A", "9915:b") —
-        // fall back to identifier scheme (column 1) for the publicIdentifier.
-        // If the client has no matching identifier, use the endpoint portion
-        // of the composite as the centralised fallback ID.
-        if (preg_match('/^(\d{4}):(.+)$/', $scheme, $m)) {
-            $compositeEndpointId = $m[2];
-            $scheme = $router->resolveIdentifierScheme($country, $classification);
-            if (empty($scheme)) {
-                return null;
+        $wireLines = $this->storecove_invoice->getInvoiceLines() ?? [];
+        foreach ($wireLines as $lineIndex => $line) {
+            foreach ($line->allowance_charges ?? [] as $allowanceIndex => $allowance) {
+                if (isset($lineIndicators[$lineIndex][$allowanceIndex])) {
+                    $allowance->setChargeIndicator($lineIndicators[$lineIndex][$allowanceIndex]);
+                }
             }
         }
 
-        // AT:GOV always routes to the fixed endpoint "b" per Storecove docs.
-        // The client's id_number is used for customerAssignedAccountIdValue (set elsewhere).
-        if ($country === 'AT' && $classification === 'government') {
-            return ['scheme' => 'AT:GOV', 'id' => 'b'];
-        }
-
-        // GLN and IT:CUUO always use routing_id
-        if ($scheme === 'GLN' || str_contains($scheme, ':CUUO')) {
-            $raw = $client->routing_id ?? '';
-            if (strlen($raw) > 1) {
-                return ['scheme' => $scheme, 'id' => trim($raw)];
-            }
-            return null;
-        }
-
-        // Determine value priority based on scheme type
-        $is_vat_scheme = str_contains($scheme, ':VAT') || str_contains($scheme, ':IVA') || str_contains($scheme, ':CF');
-
-        if ($is_vat_scheme) {
-            // [value, is_fallback_source]
-            $candidates = [
-                [$client->vat_number ?? '', false],
-                [$client->id_number ?? '', true],
-            ];
-        } else {
-            $candidates = [
-                [$client->id_number ?? '', false],
-                [$client->vat_number ?? '', true],
-            ];
-        }
-
-        foreach ($candidates as [$raw, $is_fallback]) {
-            if (strlen($raw) < 2) {
+        $documentIndicators = [];
+        foreach ($dom->documentElement->childNodes as $child) {
+            if ($child->nodeType !== XML_ELEMENT_NODE
+                || $child->namespaceURI !== $cacNs
+                || $child->localName !== 'AllowanceCharge') {
                 continue;
             }
 
-            // Light clean: strip whitespace and dots only (preserves hyphens for SG:GST etc.)
-            $light = preg_replace("/[\s.]/", "", $raw);
-            // Heavy clean: strip all non-alphanumeric (for schemes needing bare digits)
-            $heavy = preg_replace("/[^a-zA-Z0-9]/", "", $raw);
-            // Strip country prefix (e.g. "BE1000000417" → "1000000417")
-            $stripped = (stripos($heavy, $country) === 0 && strlen($heavy) > strlen($country))
-                ? substr($heavy, strlen($country))
-                : null;
+            $indicator = 'false';
+            foreach ($child->getElementsByTagNameNS($cbcNs, 'ChargeIndicator') as $ciNode) {
+                $indicator = trim($ciNode->textContent) ?: 'false';
+                break;
+            }
+            $documentIndicators[] = $indicator;
+        }
 
-            $variants = [$light, $heavy, $stripped];
-
-            $seen = [];
-            foreach ($variants as $val) {
-                if ($val === null || $val === '' || isset($seen[$val])) {
-                    continue;
-                }
-                $seen[$val] = true;
-
-                if (!$router->matchesSchemeFormat($scheme, $val)) {
-                    continue;
-                }
-
-                // Storecove rejects country prefixes on certain identifier schemes.
-                // Strip the prefix when using a vat_number fallback for these schemes.
-                if ($is_fallback && $stripped && $stripped !== $val
-                    && in_array($scheme, ['BE:EN', 'DK:DIGST', 'CH:UIDB'])
-                    && $router->matchesSchemeFormat($scheme, $stripped)) {
-                    return ['scheme' => $scheme, 'id' => $stripped];
-                }
-
-                return ['scheme' => $scheme, 'id' => $val];
+        foreach ($this->storecove_invoice->getAllowanceCharges() ?? [] as $index => $allowance) {
+            if (isset($documentIndicators[$index])) {
+                $allowance->setChargeIndicator($documentIndicators[$index]);
             }
         }
-
-        // No client identifier matched — if we came from a composite fixed
-        // endpoint, use the centralised endpoint ID as the fallback value.
-        if (isset($compositeEndpointId)) {
-            return ['scheme' => $scheme, 'id' => $compositeEndpointId];
-        }
-
-        return null;
     }
 
     /**

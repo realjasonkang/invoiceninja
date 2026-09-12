@@ -58,6 +58,7 @@ class ReminderJob implements ShouldQueue
             nrlog("Sending invoice reminders on " . now()->format('Y-m-d h:i:s'));
 
             Invoice::query()
+                 ->useReminderIndex()
                  ->whereIn('status_id', [Invoice::STATUS_SENT, Invoice::STATUS_PARTIAL])
                  ->where('is_deleted', 0)
                  ->whereNull('deleted_at')
@@ -76,28 +77,32 @@ class ReminderJob implements ShouldQueue
                      $this->sendReminderForInvoice($invoice);
                  });
         } else {
-            //multiDB environment, need to
 
+            //MultiDB environment, need to
+            //Hosted specific, do not fold the queries together!
             foreach (MultiDB::$dbs as $db) {
                 MultiDB::setDB($db);
 
                 nrlog("Sending invoice reminders on db {$db} " . now()->format('Y-m-d h:i:s'));
 
                 Invoice::query()
+                     ->useReminderIndex()
                      ->whereIn('status_id', [Invoice::STATUS_SENT, Invoice::STATUS_PARTIAL])
                      ->where('is_deleted', 0)
                      ->whereNull('deleted_at')
                      ->where('balance', '>', 0)
-                     ->whereBetween('next_send_date', [now()->subMonth()->startOfDay(), now()->addDay()->startOfDay()])
+                     ->whereBetween('next_send_date', [now()->subMonth()->startOfDay(), now()])
+                    //  ->whereBetween('next_send_date', [now()->subMonth()->startOfDay(), now()->addDay()->startOfDay()])
                      ->whereHas('client', function ($query) {
                          $query->where('is_deleted', 0)
                                ->where('deleted_at', null);
                      })
-                     ->whereHas('company', function ($query) {
-                         $query->where('is_disabled', 0);
-                     })
-                    ->whereHas('company.account', function ($q) {
-                        $q->whereNotNull('plan')->where('plan_expires', '>', now()->subDays(2));
+                     ->whereHas('company', function ($query)  {
+                        $query->where('is_disabled', 0)
+                            ->whereHas('account', function ($q)  {
+                                $q->whereNotNull('plan')
+                                    ->where('plan_expires', '>', now()->subDays(2));
+                            });
                     })
                      ->with('invitations')
                      ->cursor()
@@ -110,6 +115,10 @@ class ReminderJob implements ShouldQueue
 
     private function sendReminderForInvoice(Invoice $invoice)
     {
+        if (! $invoice->client->getSetting('send_reminders')) {
+            return;
+        }
+        
         App::forgetInstance('translator');
         $t = app('translator');
         $t->replace(Ninja::transformTranslations($invoice->client->getMergedSettings()));

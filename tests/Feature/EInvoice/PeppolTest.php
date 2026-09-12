@@ -17,6 +17,7 @@ use Tests\TestCase;
 use App\Models\Client;
 use App\Models\Company;
 use App\Models\Country;
+use App\Models\Credit;
 use App\Models\Invoice;
 use Tests\MockAccountData;
 use App\Models\ClientContact;
@@ -25,6 +26,7 @@ use App\DataMapper\Tax\TaxModel;
 use App\DataMapper\ClientSettings;
 use App\DataMapper\CompanySettings;
 use App\Factory\CompanyUserFactory;
+use App\Repositories\CreditRepository;
 use App\Repositories\InvoiceRepository;
 use InvoiceNinja\EInvoice\EInvoice;
 use App\Services\EDocument\Standards\Peppol;
@@ -72,7 +74,7 @@ class PeppolTest extends TestCase
         $settings = CompanySettings::defaults();
         $settings->vat_number = $params['company_vat'] ?? 'DE123456789';
         $settings->country_id = Country::where('iso_3166_2', 'DE')->first()->id;
-        $settings->email = $this->faker->safeEmail();
+        $settings->email = uniqid('testuser') . '@gmail.com';
         $settings->currency_id = '3';
         $settings->e_invoice_type = 'PEPPOL'; // Required for validation endpoint to run EntityLevel validation
 
@@ -138,12 +140,12 @@ class PeppolTest extends TestCase
             'user_id' => $client->user_id,
             'first_name' => $this->faker->firstName(),
             'last_name' => $this->faker->lastName(),
-            'email' => $this->faker->safeEmail(),
+            'email' => uniqid('testuser') . '@gmail.com',
             'is_primary' => true,
             'send_email' => true,
         ]);
 
-        $client->setRelation('contacts', [$contact]);
+        $client->setRelation('contacts', collect([$contact]));
 
         /** @var Invoice $invoice */
         $invoice = \App\Models\Invoice::factory()->create([
@@ -180,7 +182,30 @@ class PeppolTest extends TestCase
         $invoice->setRelation('client', $client);
         $invoice->setRelation('company', $company);
 
-        return compact('company', 'client', 'invoice');
+        $credit = \App\Models\Credit::factory()->create([
+            'client_id' => $client->id,
+            'company_id' => $this->company->id,
+            'user_id' => $this->user->id,
+            'date' => now()->addDay()->format('Y-m-d'),
+            'due_date' => now()->addDays(2)->format('Y-m-d'),
+            'uses_inclusive_taxes' => false,
+            'tax_rate1' => 0,
+            'tax_name1' => '',
+            'tax_rate2' => 0,
+            'tax_name2' => '',
+            'tax_rate3' => 0,
+            'tax_name3' => '',
+            'status_id' => Invoice::STATUS_DRAFT,
+        ]);
+
+
+        $credit->line_items = array_values($items);
+        $credit = $credit->calc()->getCredit();
+
+        $credit->setRelation('client', $client);
+        $credit->setRelation('company', $company);
+        
+        return compact('company', 'client', 'invoice', 'credit');
     }
 
 
@@ -512,6 +537,146 @@ class PeppolTest extends TestCase
 
         $response->assertStatus(200);
 
+    }
+
+    public function testEntityValidationPassesForCredit()
+    {
+        $scenario = [
+            'company_vat' => 'DE923356489',
+            'company_country' => 'DE',
+            'client_country' => 'DE',
+            'client_vat' => 'DE923256489',
+            'client_id_number' => '123456789',
+            'classification' => 'business',
+            'has_valid_vat' => true,
+            'over_threshold' => true,
+            'legal_entity_id' => 290868,
+            'is_tax_exempt' => false,
+        ];
+
+        $entity_data = $this->setupTestData($scenario);
+        $client = $entity_data['client'];
+        $company = $entity_data['company'];
+
+        $client->address1 = 'Test Address';
+        $client->city = 'Test City';
+        $client->postal_code = '12345';
+        $client->save();
+
+        $settings = $company->settings;
+        $settings->address1 = 'some address';
+        $settings->city = 'some city';
+        $settings->postal_code = '102394';
+        $company->settings = $settings;
+        $company->save();
+
+        $item = new InvoiceItem();
+        $item->quantity = 1;
+        $item->cost = 100;
+        $item->product_key = 'test';
+        $item->notes = 'Description';
+        $item->is_amount_discount = true;
+        $item->discount = 0;
+        $item->tax_id = '1';
+
+        $credit = Credit::factory()->create([
+            'client_id' => $client->id,
+            'company_id' => $company->id,
+            'user_id' => $this->user->id,
+            'date' => now()->addDay()->format('Y-m-d'),
+            'uses_inclusive_taxes' => false,
+            'discount' => 0,
+            'is_amount_discount' => true,
+            'tax_rate1' => 0,
+            'tax_name1' => '',
+            'tax_rate2' => 0,
+            'tax_name2' => '',
+            'tax_rate3' => 0,
+            'tax_name3' => '',
+            'line_items' => [$item],
+        ]);
+
+        $credit->setRelation('company', $company);
+        $credit->setRelation('client', $client);
+        $credit = $credit->calc()->getCredit();
+        $credit = (new CreditRepository())->save([], $credit);
+        $credit = $credit->service()->markSent()->save();
+
+        $data = [
+            'entity' => 'credits',
+            'entity_id' => $credit->hashed_id,
+        ];
+
+        $response = $this->withHeaders([
+            'X-API-SECRET' => config('ninja.api_secret'),
+            'X-API-TOKEN' => $this->token,
+        ])->postJson('/api/v1/einvoice/validateEntity', $data);
+
+        if ($response->getStatusCode() !== 200) {
+            $p = new Peppol($credit);
+            nlog($p->run()->toXml());
+            nlog($response->json());
+        }
+
+        $response->assertStatus(200);
+    }
+
+    public function testEntityValidationFailsForCreditViaClient()
+    {
+        $scenario = [
+            'company_vat' => 'DE923356489',
+            'company_country' => 'DE',
+            'client_country' => 'FR',
+            'client_vat' => 'FRAA123456789',
+            'client_id_number' => '123456789',
+            'classification' => 'business',
+            'has_valid_vat' => true,
+            'over_threshold' => true,
+            'legal_entity_id' => 290868,
+            'is_tax_exempt' => false,
+        ];
+
+        $entity_data = $this->setupTestData($scenario);
+        $client = $entity_data['client'];
+        $client->address1 = '';
+        $client->city = '';
+        $client->save();
+
+        $item = new InvoiceItem();
+        $item->quantity = 1;
+        $item->cost = 100;
+        $item->product_key = 'test';
+        $item->notes = 'Description';
+        $item->is_amount_discount = true;
+        $item->discount = 0;
+        $item->tax_id = '1';
+
+        $credit = Credit::factory()->create([
+            'client_id' => $client->id,
+            'company_id' => $entity_data['company']->id,
+            'user_id' => $this->user->id,
+            'date' => now()->addDay()->format('Y-m-d'),
+            'uses_inclusive_taxes' => false,
+            'discount' => 0,
+            'is_amount_discount' => true,
+            'line_items' => [$item],
+        ]);
+
+        $credit = (new CreditRepository())->save([], $credit);
+
+        $data = [
+            'entity' => 'credits',
+            'entity_id' => $credit->hashed_id,
+        ];
+
+        $response = $this->withHeaders([
+            'X-API-SECRET' => config('ninja.api_secret'),
+            'X-API-TOKEN' => $this->token,
+        ])->postJson('/api/v1/einvoice/validateEntity', $data);
+
+        $response->assertStatus(422)
+            ->assertJsonPath('invoice', [])
+            ->assertJsonStructure(['passes', 'credit', 'invoice', 'client', 'company']);
     }
 
 
@@ -1532,6 +1697,7 @@ class PeppolTest extends TestCase
             'calculate_taxes' => true,
             'tax_data' => $tax_data,
             'legal_entity_id' => 290868,
+            'custom_surcharge_taxes1' => true,
         ]);
 
         $cu = CompanyUserFactory::create($this->user->id, $company->id, $this->account->id);
@@ -2729,6 +2895,258 @@ class PeppolTest extends TestCase
 
         $this->assertCount(0, $errors);
 
+    }
+
+    /**
+     * Standard scenario used for the blank-line tests below.
+     * DE→DE business with valid VAT — keeps test setup boilerplate to a
+     * minimum so each test can focus on what it's asserting.
+     */
+    private function blankItemScenario(): array
+    {
+        return [
+            'company_vat'      => 'DE923356489',
+            'company_country'  => 'DE',
+            'client_country'   => 'DE',
+            'client_vat'       => 'DE923256489',
+            'client_id_number' => '123456789',
+            'classification'   => 'business',
+            'has_valid_vat'    => true,
+            'over_threshold'   => true,
+            'legal_entity_id'  => 290868,
+            'is_tax_exempt'    => false,
+        ];
+    }
+
+    private function makeRealItem(string $key, float $cost = 100.0, float $qty = 1.0): InvoiceItem
+    {
+        $item = new InvoiceItem();
+        $item->product_key        = $key;
+        $item->cost               = $cost;
+        $item->quantity           = $qty;
+        $item->tax_name1          = 'VAT';
+        $item->tax_rate1          = 19;
+        $item->tax_id             = '1';
+        $item->is_amount_discount = false;
+        $item->discount           = 0;
+        return $item;
+    }
+
+    private function buildAndSave(array $line_items): Invoice
+    {
+        $entity_data = $this->setupTestData($this->blankItemScenario());
+
+        $invoice = $entity_data['invoice'];
+        $invoice->is_amount_discount   = false;
+        $invoice->discount             = 0;
+        $invoice->uses_inclusive_taxes = false;
+        $invoice->line_items           = $line_items;
+        $invoice = $invoice->calc()->getInvoice();
+
+        $repo = new InvoiceRepository();
+        $invoice = $repo->save([], $invoice);
+
+        $invoice->setRelation('company', $entity_data['company']);
+        $invoice->setRelation('client', $entity_data['client']);
+        $invoice->service()->markSent()->save();
+
+        return $invoice;
+    }
+
+    /**
+     * Integration: a fully-blank ghost row mixed with valid rows is
+     * dropped from the Peppol XML, surviving rows are renumbered
+     * contiguously, and the schematron passes cleanly.
+     */
+    public function testBlankRowDroppedFromPeppolXml(): void
+    {
+        $real1  = $this->makeRealItem('Widget A', 100, 2);
+        $blank  = new InvoiceItem(); // ghost row — all defaults
+        $real2  = $this->makeRealItem('Widget B', 50, 1);
+
+        $invoice = $this->buildAndSave([$real1, $blank, $real2]);
+
+        $peppol = new Peppol($invoice);
+        $peppol->run();
+        $xml = $peppol->toXml();
+
+        $this->assertEmpty($peppol->getErrors());
+
+        $dom = new \DOMDocument();
+        $dom->loadXML($xml);
+        $xpath = new \DOMXPath($dom);
+        $xpath->registerNamespace('cac', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+        $xpath->registerNamespace('cbc', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
+
+        // Two surviving lines, not three.
+        $this->assertSame(2, $xpath->query('//cac:InvoiceLine')->length);
+
+        // IDs renumbered 1, 2 — no gap from the dropped middle row.
+        $ids = [];
+        foreach ($xpath->query('//cac:InvoiceLine/cbc:ID') as $node) {
+            $ids[] = $node->nodeValue;
+        }
+        $this->assertSame(['1', '2'], $ids);
+
+        // Surviving items keep their identity (Widget A and Widget B).
+        $names = [];
+        foreach ($xpath->query('//cac:InvoiceLine/cac:Item/cbc:Name') as $node) {
+            $names[] = $node->nodeValue;
+        }
+        $this->assertSame(['Widget A', 'Widget B'], $names);
+
+        // Schematron pipeline passes.
+        $validator = new XsltDocumentValidator($xml);
+        $validator->validate();
+        $this->assertCount(
+            0,
+            $validator->getErrors(),
+            'Schematron errors after dropping blank row: ' . json_encode($validator->getErrors())
+        );
+
+        // No errors pushed onto the Peppol service either.
+        $this->assertEmpty($peppol->getErrors());
+    }
+
+    /**
+     * Integration: an invoice consisting of only blank rows builds an XML
+     * with zero InvoiceLine elements. The schematron's existing "must have
+     * at least one line" rule (CEN-EN16931-UBL.xslt #957: `exists(cac:InvoiceLine)
+     * or exists(cac:CreditNoteLine)`) surfaces the failure naturally — the
+     * builder itself stays silent, consistent with the per-row drop policy.
+     */
+    public function testAllBlankInvoiceLeavesEmptyLinesForSchematronToCatch(): void
+    {
+        $invoice = $this->buildAndSave([new InvoiceItem(), new InvoiceItem()]);
+
+        $peppol = new Peppol($invoice);
+        $peppol->run();
+        $xml = $peppol->toXml();
+
+        $dom = new \DOMDocument();
+        $dom->loadXML($xml);
+        $xpath = new \DOMXPath($dom);
+        $xpath->registerNamespace('cac', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+
+        $this->assertSame(0, $xpath->query('//cac:InvoiceLine')->length);
+
+        // Schematron flags the empty-document case via its own rule.
+        $validator = new XsltDocumentValidator($xml);
+        $validator->validate();
+        $this->assertNotEmpty(
+            $validator->getErrors(),
+            'Schematron should reject an invoice with no InvoiceLine elements'
+        );
+    }
+
+    /**
+     * Integration: a billable row with a non-zero cost but missing
+     * tax_name1 must NOT be silently dropped — that would change the
+     * invoice total. The schematron should surface the real error.
+     */
+    public function testBillableRowMissingTaxNameIsKept(): void
+    {
+        $tagged = $this->makeRealItem('Widget A', 100, 1);
+
+        $untaxed = new InvoiceItem();
+        $untaxed->product_key = 'Untaxed';
+        $untaxed->cost        = 50;
+        $untaxed->quantity    = 1;
+        // deliberately no tax_name1 / tax_rate1
+
+        $invoice = $this->buildAndSave([$tagged, $untaxed]);
+
+        $peppol = new Peppol($invoice);
+        $peppol->run();
+        $xml = $peppol->toXml();
+
+        $dom = new \DOMDocument();
+        $dom->loadXML($xml);
+        $xpath = new \DOMXPath($dom);
+        $xpath->registerNamespace('cac', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
+
+        // Both lines kept — predicate guarantees a non-zero cost row is never dropped.
+        $this->assertSame(
+            2,
+            $xpath->query('//cac:InvoiceLine')->length,
+            'Billable row missing tax_name1 must NOT be silently dropped'
+        );
+    }
+
+    private function setupValidatedClient(): Client
+    {
+        $entity_data = $this->setupTestData($this->blankItemScenario());
+
+        $client = $entity_data['client'];
+        $client->address1 = 'Test Address';
+        $client->city = 'Test City';
+        $client->postal_code = '12345';
+        $client->save();
+
+        return $client;
+    }
+
+    /**
+     * Negative internal cost on a negative invoice is projected into CreditedQuantity
+     * sign (PriceAmount stays ≥ 0) and must not trip the negative-price guard.
+     */
+    public function testNegativeLinePriceOnNegativeInvoiceIsProjected(): void
+    {
+        $client = $this->setupValidatedClient();
+
+        $invoice = $this->buildAndSave([$this->makeRealItem('Widget A', -100, 1)]);
+        $invoice->setRelation('client', $client);
+
+        $this->assertLessThan(0, $invoice->amount, 'Fixture must produce a negative invoice total');
+
+        $result = (new EntityLevel())->checkInvoice($invoice);
+
+        $this->assertNotContains(
+            ctrans('texts.peppol_negative_line_price'),
+            $result['invoice'],
+            'Negative cost on credit-note route is projected — not rejected as a negative price'
+        );
+    }
+
+    /**
+     * Negative prices are invalid for Peppol regardless of document type - a
+     * negative line on an otherwise positive invoice must be rejected too, not
+     * just on credit-note-proxied negative invoices.
+     */
+    public function testNegativeLinePriceOnPositiveInvoiceIsRejected(): void
+    {
+        $client = $this->setupValidatedClient();
+
+        // Net positive total, but one line carries a negative price.
+        $invoice = $this->buildAndSave([
+            $this->makeRealItem('Widget A', 100, 1),
+            $this->makeRealItem('Widget B', -10, 1),
+        ]);
+        $invoice->setRelation('client', $client);
+
+        $this->assertGreaterThan(0, $invoice->amount, 'Fixture must produce a positive invoice total');
+
+        $result = (new EntityLevel())->checkInvoice($invoice);
+
+        $this->assertContains(ctrans('texts.peppol_negative_line_price'), $result['invoice'], 'Negative price must be rejected even on a positive invoice');
+    }
+
+    /**
+     * A legitimately-built negative invoice — positive price, negative quantity —
+     * proxies cleanly to a credit note and must NOT trip the negative-price guard.
+     */
+    public function testNegativeInvoiceWithPositivePriceDoesNotTripGuard(): void
+    {
+        $client = $this->setupValidatedClient();
+
+        $invoice = $this->buildAndSave([$this->makeRealItem('Widget A', 100, -1)]);
+        $invoice->setRelation('client', $client);
+
+        $this->assertLessThan(0, $invoice->amount, 'Fixture must produce a negative invoice total');
+
+        $result = (new EntityLevel())->checkInvoice($invoice);
+
+        $this->assertNotContains(ctrans('texts.peppol_negative_line_price'), $result['invoice'], 'Positive prices must not trip the negative-price guard');
     }
 
 }

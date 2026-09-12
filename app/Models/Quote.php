@@ -29,6 +29,7 @@ use Laracasts\Presenter\PresentableTrait;
 use App\Helpers\Invoice\InvoiceSumInclusive;
 use App\Events\Quote\QuoteReminderWasEmailed;
 use Illuminate\Database\Eloquent\SoftDeletes;
+use App\Models\Traits\HasTags;
 use App\Models\Traits\IndexableItems;
 /**
  * App\Models\Quote
@@ -56,7 +57,7 @@ use App\Models\Traits\IndexableItems;
  * @property string|null|Carbon $due_date
  * @property string|null $next_send_date
  * @property bool $is_deleted
- * @property array|null $line_items
+ * @property object|array|string $line_items
  * @property object|null $backup
  * @property QuoteSync|null $sync
  * @property string|null $footer
@@ -69,7 +70,7 @@ use App\Models\Traits\IndexableItems;
  * @property float $tax_rate2
  * @property string|null $tax_name3
  * @property float $tax_rate3
- * @property string $total_taxes
+ * @property float $total_taxes
  * @property bool $uses_inclusive_taxes
  * @property string|null $custom_value1
  * @property string|null $custom_value2
@@ -124,6 +125,7 @@ use App\Models\Traits\IndexableItems;
  * @property-read \Illuminate\Database\Eloquent\Collection<int, \App\Models\Document> $documents
  * @property-read \Illuminate\Database\Eloquent\Collection<int, \App\Models\Backup> $history
  * @property-read \Illuminate\Database\Eloquent\Collection<int, \App\Models\QuoteInvitation> $invitations
+ * @property-read \Illuminate\Database\Eloquent\Collection<int, \App\Models\Tag> $tags
  * @mixin \Eloquent
  * @mixin \Illuminate\Database\Eloquent\Builder
  */
@@ -136,6 +138,7 @@ class Quote extends BaseModel
     use PresentableTrait;
     use MakesInvoiceValues;
     use Searchable;
+    use HasTags;
     Use IndexableItems;
     /**
      * Get the index name for the model.
@@ -221,13 +224,7 @@ class Quote extends BaseModel
 
     public function toSearchableArray(): array
     {
-        return config('scout.index_version', 'legacy') === 'v2'
-            ? $this->toSearchableArrayV2()
-            : $this->toSearchableArrayLegacy();
-    }
-
-    public function toSearchableArrayLegacy(): array
-    {
+        
         $locale = $this->company->locale();
         App::setLocale($locale);
 
@@ -235,6 +232,8 @@ class Quote extends BaseModel
             'id' => $this->company->db . ":" . $this->id,
             'name' => ctrans('texts.quote') . " " . ($this->number ?? '') . " | " . $this->client->present()->name() . ' | ' . Number::formatMoney($this->amount, $this->company) . ' | ' . $this->translateDate($this->date, $this->company->date_format(), $locale),
             'hashed_id' => $this->hashed_id,
+            'user_id' => (string) $this->user_id,
+            'assigned_user_id' => (string) $this->assigned_user_id,
             'number' => (string) $this->number,
             'is_deleted' => (bool) $this->is_deleted,
             'amount' => (float) $this->amount,
@@ -247,30 +246,7 @@ class Quote extends BaseModel
             'custom_value4' => (string) $this->custom_value4,
             'company_key' => $this->company->company_key,
             'po_number' => (string) $this->po_number,
-        ];
-    }
-
-    public function toSearchableArrayV2(): array
-    {
-        $locale = $this->company->locale();
-        App::setLocale($locale);
-
-        return [
-            'id' => $this->company->db . ":" . $this->id,
-            'name' => ctrans('texts.quote') . " " . ($this->number ?? '') . " | " . $this->client->present()->name() . ' | ' . Number::formatMoney($this->amount, $this->company) . ' | ' . $this->translateDate($this->date, $this->company->date_format(), $locale),
-            'hashed_id' => $this->hashed_id,
-            'number' => (string) $this->number,
-            'is_deleted' => (bool) $this->is_deleted,
-            'amount' => (float) $this->amount,
-            'balance' => (float) $this->balance,
-            'due_date' => $this->due_date,
-            'date' => $this->date,
-            'custom_value1' => (string) $this->custom_value1,
-            'custom_value2' => (string) $this->custom_value2,
-            'custom_value3' => (string) $this->custom_value3,
-            'custom_value4' => (string) $this->custom_value4,
-            'company_key' => $this->company->company_key,
-            'po_number' => (string) $this->po_number,
+            'tags' => $this->tags->pluck('name')->values()->all(),
             'line_items' => $this->indexLineItems(),
         ];
     }
@@ -340,6 +316,11 @@ class Quote extends BaseModel
     public function invoice(): \Illuminate\Database\Eloquent\Relations\BelongsTo
     {
         return $this->belongsTo(Invoice::class)->withTrashed();
+    }
+
+    public function purchase_orders(): \Illuminate\Database\Eloquent\Relations\HasMany
+    {
+        return $this->hasMany(PurchaseOrder::class);
     }
 
     public function assigned_user(): \Illuminate\Database\Eloquent\Relations\BelongsTo

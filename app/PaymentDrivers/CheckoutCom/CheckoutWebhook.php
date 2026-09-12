@@ -53,6 +53,14 @@ class CheckoutWebhook implements ShouldQueue
             nlog("Checkout Webhook type not set");
         }
 
+        if(!$this->company_gateway) {
+            nlog("Checkout Webhook: company gateway not found");
+            nlog($this->company_gateway_id);
+            nlog($this->company_key);
+            nlog($this->webhook_array);
+            return;
+        }
+
         /** @phpstan-ignore-next-line */
         match ($this->webhook_array['type']) {
             'payment_approved' => $this->paymentApproved(),
@@ -95,6 +103,8 @@ class CheckoutWebhook implements ShouldQueue
 
             if (!$payment_hash) {
                 nlog("Checkout Webhook: payment hash not found for udf2={$metadata['udf2']}");
+                nlog("Current database = ". config('database.default'));
+                nlog($metadata);
                 return;
             }
 
@@ -150,7 +160,17 @@ class CheckoutWebhook implements ShouldQueue
                 return;
             }
 
-            $payment->status_id = $type === 'payment_canceled' ? Payment::STATUS_CANCELLED : Payment::STATUS_FAILED;
+            /**
+             * Declined, expired and cancelled are one outcome for the invoice: the money is
+             * not coming. The payment was applied when Checkout reported it pending or
+             * captured, so it has to come off the invoice, and the failed state is what
+             * releases the gateway fee.
+             *
+             * @see \App\Services\Invoice\ReverseGatewayFee
+             */
+            $payment->service()->deletePayment();
+
+            $payment->status_id = Payment::STATUS_FAILED;
             $payment->save();
 
             SystemLogger::dispatch(
@@ -176,7 +196,6 @@ class CheckoutWebhook implements ShouldQueue
             }
 
             $driver = $this->company_gateway->driver($payment_hash->fee_invoice->client)->init();
-            $driver->unWindGatewayFees($payment_hash);
 
             SystemLogger::dispatch(
                 ['response' => $this->webhook_array],

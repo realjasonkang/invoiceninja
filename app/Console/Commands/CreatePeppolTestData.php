@@ -59,7 +59,7 @@ class CreatePeppolTestData extends Command
         'EE' => 0, // Estonia
         'ES' => 0, // Spain
         'FI' => 0, // Finland
-        'FR' => 293338, // FR82345678911
+        'FR' => 1003223, // FR84345678911
         'GB' => 0, // United Kingdom
         'GR' => 0, // Greece
         'HR' => 0, // Croatia
@@ -82,7 +82,7 @@ class CreatePeppolTestData extends Command
         'NL' => 0, // Netherlands
         'NO' => 0, // Norway
         'NZ' => 0, // New Zealand
-        'PL' => 0, // Poland
+        'PL' => 999794, // Poland
         'PT' => 0, // Portugal
         'RO' => 294639, //RO010105019
         'RS' => 0, // Serbia
@@ -198,7 +198,7 @@ class CreatePeppolTestData extends Command
             ],
             // FR — Storecove test: FR:SIRENE 123456987 (scheme is SIRENE, not VAT)
             'FR' => [
-                'vat' => 'FR82345678911', 'id_number' => '123456987', 'tax_rate' => 20, 'tax_name' => 'TVA',
+                'vat' => 'FR11123456782', 'id_number' => '12345678200010', 'tax_rate' => 20, 'tax_name' => 'TVA',
                 'city' => 'Paris', 'state' => 'Ile-de-France', 'postal_code' => '75001', 'currency' => '3',
                 'address1' => 'Rue de Rivoli 1',
                 'gov_id' => '12345678901234', 'individual_id' => '', 'individual_vat' => '',

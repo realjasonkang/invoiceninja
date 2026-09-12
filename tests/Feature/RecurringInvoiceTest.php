@@ -648,6 +648,59 @@ class RecurringInvoiceTest extends TestCase
         $this->assertEquals(RecurringInvoice::STATUS_DRAFT, $arr['data']['status_id']);
     }
 
+    public function testStoredRecurringInvoiceAmountIncludesDiscountsAndTaxes(): void
+    {
+        $data = [
+            'client_id' => $this->client->hashed_id,
+            'frequency_id' => 5,
+            'next_send_date' => now()->addMonth()->format('Y-m-d'),
+            'discount' => 20,
+            'is_amount_discount' => true,
+            'tax_name1' => 'GST',
+            'tax_rate1' => 10,
+            'line_items' => [[
+                'product_key' => 'service',
+                'notes' => 'Taxable service',
+                'cost' => 100,
+                'quantity' => 2,
+                'tax_name1' => '',
+                'tax_rate1' => 0,
+                'tax_name2' => '',
+                'tax_rate2' => 0,
+                'tax_name3' => '',
+                'tax_rate3' => 0,
+            ]],
+        ];
+
+        $response = $this->withHeaders([
+            'X-API-SECRET' => config('ninja.api_secret'),
+            'X-API-TOKEN' => $this->token,
+        ])->postJson('/api/v1/recurring_invoices', $data);
+
+        $response->assertOk();
+
+        $storedRecurringInvoice = RecurringInvoice::query()->findOrFail(
+            $this->decodePrimaryKey($response->json('data.id'))
+        );
+        $generatedInvoice = RecurringInvoiceToInvoiceFactory::create(
+            $storedRecurringInvoice,
+            $this->client,
+        )->calc()->getInvoice();
+
+        $this->assertNotEquals(200, (float) $response->json('data.amount'));
+        $this->assertGreaterThan(0, (float) $response->json('data.total_taxes'));
+        $this->assertEqualsWithDelta(
+            (float) $generatedInvoice->amount,
+            (float) $response->json('data.amount'),
+            0.000001,
+        );
+        $this->assertEqualsWithDelta(
+            (float) $storedRecurringInvoice->amount,
+            (float) $response->json('data.amount'),
+            0.000001,
+        );
+    }
+
     public function testPostRecurringInvoiceWithStartAndStop()
     {
         $data = [
@@ -1110,5 +1163,50 @@ class RecurringInvoiceTest extends TestCase
         $arr = $response->json();
 
         $this->assertEquals('1', $arr['meta']['pagination']['total']);
+    }
+
+    public function testStoreRecurringInvoiceWithMinimalPayload()
+    {
+        $client = Client::factory()->create([
+            'user_id' => $this->user->id,
+            'company_id' => $this->company->id,
+        ]);
+
+        ClientContact::factory()->create([
+            'user_id' => $this->user->id,
+            'company_id' => $this->company->id,
+            'client_id' => $client->id,
+            'is_primary' => 1,
+            'send_email' => true,
+        ]);
+
+        $data = [
+            'client_id' => $client->hashed_id,
+            'frequency_id' => '5',
+            'line_items' => [
+                [
+                    'cost' => 1,
+                    'line_total' => 1,
+                    'notes' => 'x',
+                    'quantity' => 1,
+                ],
+            ],
+        ];
+
+        $response = $this->withHeaders([
+            'X-API-SECRET' => config('ninja.api_secret'),
+            'X-API-TOKEN' => $this->token,
+        ])->postJson('/api/v1/recurring_invoices', $data);
+
+        $response->assertStatus(200);
+
+        $arr = $response->json();
+
+        $this->assertEquals($client->hashed_id, $arr['data']['client_id']);
+        $this->assertEquals(5, $arr['data']['frequency_id']);
+        $this->assertCount(1, $arr['data']['line_items']);
+        $this->assertEquals(1, $arr['data']['line_items'][0]['cost']);
+        $this->assertEquals(1, $arr['data']['line_items'][0]['quantity']);
+        $this->assertEquals('x', $arr['data']['line_items'][0]['notes']);
     }
 }

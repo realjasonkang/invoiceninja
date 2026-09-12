@@ -171,7 +171,7 @@ trait Utilities
             $error_message = 'Error processing payment.';
         }
 
-        if (isset($_payment['actions'][0]['response_summary']) ?? false) {
+        if (isset($_payment['actions'][0]['response_summary'])) {
             $error_message = $_payment['actions'][0]['response_summary'];
         }
 
@@ -201,6 +201,20 @@ trait Utilities
 
     private function processPendingPayment($_payment)
     {
+        if (isset($_payment['id'])) {
+            $data = [
+                'checkout_payment_id' => $_payment['id'],
+            ];
+        
+            if (isset($_payment['_links']['redirect']['href'])) {
+                $data['checkout_redirect_url'] = $_payment['_links']['redirect']['href'];
+            }
+        
+            $paymentHash = $this->getParent()->payment_hash;
+            $paymentHash->data = array_merge((array) $paymentHash->data, $data);
+            $paymentHash->save();
+        }
+        
         // Legacy Frames: 3DS redirect — the response contains a redirect link.
         // This must be checked first as legacy pending responses also have an 'id'.
         if (isset($_payment['_links']['redirect']['href'])) {
@@ -266,7 +280,9 @@ trait Utilities
                 'payment_method_id' => $this->getParent()->payment_hash->data->payment_method_id ?? GatewayType::CREDIT_CARD,
             ];
 
-            return $this->getParent()->storePaymentMethod($data, ['gateway_customer_reference' => $response['customer']['id'] ?? '']);
+            return $this->getParent()->storePaymentMethod($data, [
+                'gateway_customer_reference' => $response['customer']['id'] ?? null,
+            ]);
         } catch (Exception $e) {
             session()->flash('message', ctrans('texts.payment_method_saving_failed'));
         }
